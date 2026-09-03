@@ -1,0 +1,28 @@
+workdir/
+logs/
+*.local
+.env
+config.local.env
+
+# editor swap files
+*.swp
+*.swo
+*~
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# Durable audit record — lives in its own repo (see AUDIT_DIR / audit.py).
+# Kept out of the codebase so this repo can be published.
+reviews/
+ledger/
+audit-data/

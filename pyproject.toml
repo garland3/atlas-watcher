@@ -1,0 +1,21 @@
+[project]
+name = "atlas-watcher"
+version = "0.1.0"
+description = "PR/issue review bot for sandialabs/atlas-ui-3 — posts as AGENT-REVIEW-BOT-3"
+authors = [
+    { name = "anthony garland", email = "garland3@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[project.scripts]
+atlas-watcher = "atlas_watcher.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
