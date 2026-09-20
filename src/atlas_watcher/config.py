@@ -55,6 +55,23 @@ class Settings(BaseSettings):
     # Cap the diff size we feed agents so prompts stay tractable.
     diff_context_max_bytes: int = 200_000
 
+    # Agent rate/session limits are account-wide, not per item. When an agent
+    # reports one the watcher sets a global cooldown and skips whole passes
+    # until it expires, instead of launching swarms that are certain to fail.
+    # The reset time named by the agent is honored when it parses; otherwise
+    # the pause backs off exponentially (base * 2^(consecutive-1)), capped.
+    # Because cron may fire every 15 min, these are the only backstop against a
+    # tight retry loop while the account is capped.
+    agent_limit_backoff_secs: int = 3600
+    agent_limit_backoff_max_secs: int = 21_600
+
+    # Per-item retry backoff. An item that failed is not retried until
+    # base * 2^(failures-1) seconds have elapsed, capped. Failure kinds that
+    # are not the item's fault (a rate limit) are recorded as "deferred" and
+    # do not consume this budget at all.
+    retry_backoff_base_secs: int = 900
+    retry_backoff_max_secs: int = 86_400
+
     # Security triage thresholds. Risk levels are ordered low < medium < high < critical.
     # If the verdict is at or above security_block_above the swarm/triage is skipped
     # and no upstream comment is posted. If at or above security_warn_above, the

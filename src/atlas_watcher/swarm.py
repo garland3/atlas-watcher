@@ -26,9 +26,38 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import cooldown
 from .config import settings
 from .log import log
 from .paths import PROMPTS
+
+
+class AgentLimitError(RuntimeError):
+    """Raised when an agent reports an account-wide rate/session limit.
+
+    Callers treat this as infrastructure, not a defect in the item: it sets a
+    global cooldown and is recorded as ``deferred`` so it never consumes the
+    per-item retry budget.
+    """
+
+    def __init__(self, message: str, reset_ts: float | None = None) -> None:
+        super().__init__(message)
+        self.reset_ts = reset_ts
+
+
+def _limit_from_logs(*paths: Path) -> cooldown.LimitInfo | None:
+    for p in paths:
+        try:
+            if p.is_file():
+                info = cooldown.classify_limit(
+                    p.read_text(encoding="utf-8", errors="ignore")
+                )
+                if info:
+                    return info
+        except OSError:
+            continue
+    return None
+
 
 
 @dataclass(frozen=True)
@@ -130,20 +159,57 @@ def _session_alive(session: str) -> bool:
     ).returncode == 0
 
 
+def _is_stub(path: Path) -> bool:
+    """True if a findings file is the placeholder the harness writes when an
+    agent produced nothing (as opposed to real findings)."""
+    try:
+        return "NO_FINDINGS" in path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return True
+
+
+def _agent_completed(done_path: Path, findings_path: Path) -> bool:
+    """True if this perspective finished cleanly and its findings are real.
+
+    A resumable swarm skips these agents. The sentinel carries the runner's
+    exit code, so a crash (rc != 0) or a stub findings file means "re-run".
+    """
+    if not done_path.is_file() or not findings_path.is_file():
+        return False
+    try:
+        rc = int(done_path.read_text(encoding="utf-8").strip() or "1")
+    except ValueError:
+        return False
+    if rc != 0:
+        return False
+    return findings_path.stat().st_size > 0 and not _is_stub(findings_path)
+
+
+def perspectives_complete(out_dir: Path) -> bool:
+    perspectives_dir = out_dir / "perspectives"
+    return all(
+        _agent_completed(
+            perspectives_dir / ".sentinels" / f"{p.name}.done",
+            perspectives_dir / f"{p.name}.md",
+        )
+        for p in PERSPECTIVES
+    )
+
+
 def run_swarm(repo: str, pr_number: int, checkout: Path,
               out_dir: Path, context_file: Path) -> None:
-    """Launch all perspectives in parallel and block until done."""
+    """Launch all perspectives in parallel and block until done.
+
+    Resumable: an agent whose sentinel exists with rc=0 and whose findings
+    file is real is left alone, so a re-run after a manager failure only
+    re-executes the agents that actually need it (usually none).
+    """
     perspectives_dir = out_dir / "perspectives"
     sentinels_dir = perspectives_dir / ".sentinels"
     logs_dir = perspectives_dir / ".logs"
     runners_dir = perspectives_dir / ".runners"
     for d in (perspectives_dir, sentinels_dir, logs_dir, runners_dir):
         d.mkdir(parents=True, exist_ok=True)
-
-    repo_slug_safe = repo.replace("/", "-")
-    session = f"swarm-{repo_slug_safe}-pr-{pr_number}-{os.getpid()}"
-    subprocess.run(["tmux", "kill-session", "-t", session],
-                   check=False, capture_output=True)
 
     plans = []
     for p in PERSPECTIVES:
@@ -153,7 +219,15 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
         stderr_log = logs_dir / f"{p.name}.stderr.log"
         done_path = sentinels_dir / f"{p.name}.done"
         runner_path = runners_dir / f"{p.name}.sh"
+        plans.append((p, prompt_path, runner_path, done_path, findings_path,
+                      stdout_log, stderr_log))
 
+    pending = [pl for pl in plans if not _agent_completed(pl[3], pl[4])]
+    if not pending:
+        log("swarm: all perspectives already complete — resuming at manager")
+        return
+
+    for p, prompt_path, runner_path, done_path, findings_path, stdout_log, stderr_log in pending:
         prompt_path.write_text(
             _build_prompt(p, context_file, findings_path), encoding="utf-8",
         )
@@ -168,15 +242,19 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
             stderr_log=stderr_log,
             done=done_path,
         )
-        plans.append((p, runner_path, done_path, findings_path))
 
-    first_p, first_runner, *_ = plans[0]
+    repo_slug_safe = repo.replace("/", "-")
+    session = f"swarm-{repo_slug_safe}-pr-{pr_number}-{os.getpid()}"
+    subprocess.run(["tmux", "kill-session", "-t", session],
+                   check=False, capture_output=True)
+
+    first_p, _, first_runner, *_ = pending[0]
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", session, "-x", "220", "-y", "50",
          "-n", first_p.name, "bash", str(first_runner)],
         check=True,
     )
-    for p, runner, _, _ in plans[1:]:
+    for p, _, runner, *_ in pending[1:]:
         subprocess.run(
             ["tmux", "new-window", "-t", session, "-n", p.name,
              "bash", str(runner)],
@@ -187,27 +265,28 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
         ["tmux", "list-windows", "-t", session, "-F", "#{window_name}"],
         capture_output=True, text=True, check=True,
     ).stdout.split()
-    expected = {p.name for p in PERSPECTIVES}
+    expected = {p.name for p, *_ in pending}
     missing = expected - set(list_out)
     if missing:
         log(f"WARN: tmux is missing windows {sorted(missing)} — got {list_out}")
 
-    log(f"swarm started: tmux session={session}, {len(PERSPECTIVES)} agents")
+    log(f"swarm started: tmux session={session}, {len(pending)}/{len(plans)} "
+        f"agents (resuming {len(plans) - len(pending)})")
     log(f"attach with: tmux attach -t {session}")
 
-    total = len(PERSPECTIVES)
+    total = len(pending)
     last_done = -1
     while True:
-        done = sum(1 for _, _, d, _ in plans if d.is_file())
+        done = sum(1 for pl in pending if pl[3].is_file())
         if done != last_done:
             log(f"swarm progress: {done}/{total}")
             last_done = done
         if done >= total:
             break
         if not _session_alive(session):
-            for p, _, d, _ in plans:
-                if not d.is_file():
-                    d.write_text("session_died\n", encoding="utf-8")
+            for p, _, _, done_path, *_ in pending:
+                if not done_path.is_file():
+                    done_path.write_text("session_died\n", encoding="utf-8")
                     log(f"WARN: {p.name} sentinel synthesized — tmux session died")
             break
         time.sleep(10)
@@ -217,7 +296,7 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
 
     # Verify each agent actually wrote its findings file. If not, stub it so
     # the manager can flag the gap rather than silently dropping a perspective.
-    for p, _, _, findings_path in plans:
+    for p, _, _, _, findings_path, *_ in pending:
         if not findings_path.is_file() or findings_path.stat().st_size == 0:
             findings_path.write_text(
                 f"<!-- {p.name}: agent did not write findings file. "
@@ -227,7 +306,23 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
             )
             log(f"WARN: {p.name} produced no findings file; stub written")
 
+    # A rate limit can strike any agent and leaves rc=0 with a stub, so the
+    # completed-check alone would not notice. Inspect the logs we just wrote
+    # and escalate: the whole pass must pause, not limp on to the manager.
+    # Only failed agents are considered — a successful agent's logs may
+    # mention rate limiting while discussing the code under review.
+    for p, _, _, done_path, findings_path, stdout_log, stderr_log in pending:
+        if _agent_completed(done_path, findings_path):
+            continue
+        limit = _limit_from_logs(stdout_log, stderr_log)
+        if limit:
+            cooldown.record(limit)
+            raise AgentLimitError(
+                f"{p.name} hit an agent limit: {limit.reason}", limit.reset_ts,
+            )
+
     log("swarm complete")
+
 
 
 def run_single(agent: str, prompt: str, out_file: Path,
@@ -252,4 +347,13 @@ def run_single(agent: str, prompt: str, out_file: Path,
         proc = subprocess.run(cmd, input=prompt.encode("utf-8"),
                               stdout=out, stderr=err, check=False,
                               cwd=str(cwd) if cwd else None)
+
+    # A rate/session limit exits before producing usable output. Detect it
+    # here so the caller aborts instead of parsing (and caching) a garbage
+    # result, then raise: this is account-wide infrastructure, not a defect
+    # in the item being reviewed.
+    limit = _limit_from_logs(out_file, log_path)
+    if limit:
+        cooldown.record(limit)
+        raise AgentLimitError(limit.reason, limit.reset_ts)
     return proc.returncode

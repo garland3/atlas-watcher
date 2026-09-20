@@ -89,9 +89,14 @@ subcommand.
    never re-reviews work that is already in the ledger in a terminal
    state (`done` for posted reviews, `security_blocked` for items the
    security triage refused). Keys: PR head SHA, or issue comment-count
-   snapshot. Runs that fail before posting are recorded as `failed` rows;
-   after `MAX_RETRIES` failures at the same key the item is skipped until
-   the key changes or the `failed` rows are removed.
+   snapshot. Runs that fail before posting are recorded as `failed` rows
+   and retried on a per-item exponential backoff (`RETRY_BACKOFF_*`); after
+   `MAX_RETRIES` failures at the same key the item is skipped until the key
+   changes or the `failed` rows are removed. An account-wide agent
+   rate/session limit is treated differently: it is recorded as `deferred`
+   (never counted against the retry budget), sets a global cooldown, and
+   the next scan resumes on its own once the cooldown expires — the watcher
+   runs unattended, so no recovery step requires a human.
 
 ---
 
@@ -144,6 +149,7 @@ atlas-watcher/
 │   ├── __init__.py
 │   ├── cli.py                      # Typer app — every subcommand
 │   ├── config.py                   # Settings model (config.env loader)
+│   ├── cooldown.py                 # global pause after an agent rate limit
 │   ├── paths.py                    # filesystem layout
 │   ├── log.py                      # rich console logger
 │   ├── ledger.py                   # append + has_done over ledger.jsonl
@@ -170,7 +176,8 @@ atlas-watcher/
 ├── workdir/<owner>/<name>/        # ONE persistent clone per upstream repo
 │                                   # (kept across runs; only fetch + checkout
 │                                   # on subsequent reviews); gitignored
-└── logs/                           # gitignored
+└── logs/                           # gitignored; logs/cooldown.json is the
+                                    # ephemeral agent rate-limit cooldown
 ```
 
 The **audit record repo** (`$AUDIT_DIR`, default `../ATLAS-WATCHER-LOGS`) is a
@@ -243,7 +250,14 @@ uv run atlas-watcher issue 99            # one issue end to end
 uv run atlas-watcher pr 42 --dry-run     # do everything except post
 uv run atlas-watcher audit-init          # bootstrap the audit-record repo
 uv run atlas-watcher sync                # commit & push reviews/ + ledger/
+uv run atlas-watcher cooldown            # show the agent rate-limit cooldown
 ```
+
+`cooldown --clear` exists only to debug a stuck timer; recovery is
+automatic. A swarm is **resumable**: an agent whose sentinel exists with
+`rc=0` and whose findings file is real is not re-run, so a retry after a
+manager failure (or a rate-limit pause) re-executes only the agents that
+actually need it, not the whole 9-agent swarm.
 
 Watch a live swarm from another shell:
 
@@ -277,6 +291,15 @@ the repo field is load-bearing.
   persistently-broken run can't re-launch the swarm every poll forever.
   The counter resets naturally when the key changes; to force a retry at
   the same key, delete that item's `failed` rows from the ledger.
+- **Agent rate/session limits are not failures.** `run_swarm` and
+  `run_single` scan agent output for a limit, record a global cooldown
+  (`cooldown.py`), and raise `AgentLimitError`; `process()` then writes a
+  `deferred` row. Deferred rows are neither terminal nor counted by
+  `failure_count`, so the item retries automatically after the cooldown
+  expires. `scan` checks the cooldown before each item (and between repos),
+  so a mid-pass limit stops the pass instead of launching doomed swarms.
+  Nothing here needs a human: the cooldown self-expires and the next cron
+  pass picks up where this one stopped.
 
 Backward compat: ledger rows written before the multi-repo migration have
 no `repo` field. They are treated as belonging to the **first** repo in
@@ -346,6 +369,13 @@ Everything tunable lives in `config.env`. Override locally with
 - `MAX_RETRIES` — attempts per PR/issue key before giving up. Failures
   are appended to the ledger as `failed` rows; the counter resets when
   the key changes. Default 3.
+- `RETRY_BACKOFF_BASE_SECS`, `RETRY_BACKOFF_MAX_SECS` — per-item retry
+  backoff: after a failure, the next attempt waits
+  `base * 2^(failures-1)` seconds (capped). Defaults 900 / 86400.
+- `AGENT_LIMIT_BACKOFF_SECS`, `AGENT_LIMIT_BACKOFF_MAX_SECS` — global
+  cooldown set when an agent reports a rate/session limit. The agent's
+  stated reset time is honored when it parses; otherwise the pause backs
+  off exponentially, capped at the max. Defaults 3600 / 21600.
 - `SECURITY_BLOCK_ABOVE`, `SECURITY_WARN_ABOVE` — risk tiers (`low`,
   `medium`, `high`, `critical`) that gate the swarm. Defaults: block at
   `high`, warn at `medium`. Set both to `critical` to disable.

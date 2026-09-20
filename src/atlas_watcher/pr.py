@@ -138,13 +138,21 @@ def process(repo: str, pr_number: int, dry_run: bool = False) -> str:
             f"({settings.max_retries} failed attempts) — skipping; remove "
             f"'failed' rows from the ledger or push a new commit to retry")
         return "skipped:retries"
+    if not ledger.retry_ready(repo, "pr", pr_number, sha):
+        log(f"{repo} PR #{pr_number} @ {sha[:12]} in retry backoff until "
+            f"{ledger.next_retry_at(repo, 'pr', pr_number, sha)} — skipping")
+        return "skipped:backoff"
 
     try:
         return _process(repo, meta, dry_run)
     except Exception as e:
         if not dry_run:
+            # A rate/session limit is account-wide: record it as "deferred"
+            # so it neither counts against the retry budget nor is mistaken
+            # for a defect in this PR. The cooldown gates the next attempt.
+            status = "deferred" if isinstance(e, swarm.AgentLimitError) else "failed"
             try:
-                ledger.append(repo, "pr", pr_number, sha, status="failed",
+                ledger.append(repo, "pr", pr_number, sha, status=status,
                               error=repr(e)[:500])
             except Exception as le:
                 log(f"could not record failure in ledger: {le!r}")

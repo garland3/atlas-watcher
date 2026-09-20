@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from .config import settings
@@ -12,7 +12,7 @@ Kind = Literal["pr", "issue"]
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def append(repo: str, kind: Kind, number: int, key: str,
@@ -78,25 +78,67 @@ def has_done(repo: str, kind: Kind, number: int, key: str) -> bool:
     )
 
 
-def failure_count(repo: str, kind: Kind, number: int, key: str) -> int:
-    """Number of failed attempts recorded for (repo, kind, number, key)."""
+def _failed_rows(repo: str, kind: Kind, number: int, key: str) -> list[dict]:
     default_repo = settings.repos[0] if settings.repos else None
-    return sum(
-        1 for rec in _iter_rows()
+    return [
+        rec for rec in _iter_rows()
         if rec.get("kind") == kind
         and rec.get("number") == number
         and rec.get("key") == key
         and rec.get("status") == "failed"
         and _repo_matches(rec, repo, default_repo)
-    )
+    ]
+
+
+def failure_count(repo: str, kind: Kind, number: int, key: str) -> int:
+    """Number of failed attempts recorded for (repo, kind, number, key)."""
+    return len(_failed_rows(repo, kind, number, key))
 
 
 def retries_exhausted(repo: str, kind: Kind, number: int, key: str) -> bool:
     """True once an item has failed ``settings.max_retries`` times at the
     same key. Exhausted items are skipped until the key changes (new PR
     commit / new issue comment) or the ``failed`` rows are removed from
-    the ledger."""
+    the ledger.
+
+    Rate-limit pauses are recorded as ``deferred`` (not ``failed``), so
+    infrastructure problems never count here.
+    """
     return failure_count(repo, kind, number, key) >= settings.max_retries
+
+
+def _parse_ts(ts: str) -> datetime | None:
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return None
+
+
+def next_retry_at(repo: str, kind: Kind, number: int, key: str) -> datetime | None:
+    """When the item may next be attempted, or None if it has not failed.
+
+    Backoff is ``base * 2^(failures-1)`` seconds after the most recent
+    failure, capped at ``retry_backoff_max_secs``. This keeps a transient
+    failure from being retried on the very next pass while still retrying
+    unattended — an exhausted item is the only thing that stops permanently.
+    """
+    rows = _failed_rows(repo, kind, number, key)
+    if not rows:
+        return None
+    times = [t for t in (_parse_ts(r.get("ts", "")) for r in rows) if t]
+    if not times:
+        return None
+    delay = min(
+        settings.retry_backoff_base_secs * (2 ** (len(rows) - 1)),
+        settings.retry_backoff_max_secs,
+    )
+    return max(times) + timedelta(seconds=delay)
+
+
+def retry_ready(repo: str, kind: Kind, number: int, key: str) -> bool:
+    """False while a previously failed item is still in its backoff window."""
+    ready_at = next_retry_at(repo, kind, number, key)
+    return ready_at is None or datetime.now(UTC) >= ready_at
 
 
 def _has_terminal_evidence(rec: dict) -> bool:

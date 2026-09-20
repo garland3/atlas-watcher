@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 
 import typer
 
-from . import audit, gh, issue as issue_mod, ledger as ledger_mod, pr as pr_mod
+from . import audit, cooldown, gh, issue as issue_mod, ledger as ledger_mod, pr as pr_mod
 from .config import settings
 from .log import log
 from .paths import data_root
@@ -60,6 +61,9 @@ def _scan_repo(repo: str, dry_run: bool) -> None:
         log(f"{repo}: list PRs failed: {e!r}")
         prs = []
     for n in prs:
+        if cooldown.active():
+            log(f"{repo}: agent limit active — stopping this pass")
+            return
         try:
             pr_mod.process(repo, n, dry_run=dry_run)
         except Exception as e:
@@ -71,6 +75,9 @@ def _scan_repo(repo: str, dry_run: bool) -> None:
         log(f"{repo}: list issues failed: {e!r}")
         issues = []
     for n in issues:
+        if cooldown.active():
+            log(f"{repo}: agent limit active — stopping this pass")
+            return
         try:
             issue_mod.process(repo, n, dry_run=dry_run)
         except Exception as e:
@@ -78,9 +85,17 @@ def _scan_repo(repo: str, dry_run: bool) -> None:
 
 
 def _one_pass(dry_run: bool) -> None:
+    state = cooldown.active()
+    if state:
+        until = datetime.fromtimestamp(state["until_ts"], tz=UTC).astimezone().isoformat(timespec="seconds")
+        log(f"agent cooldown active until {until} — skipping pass")
+        return
     log(f"scan start: {len(settings.repos)} repo(s) — {settings.repos}")
     for repo in settings.repos:
         _scan_repo(repo, dry_run)
+        if cooldown.active():
+            log("agent limit hit mid-pass — stopping scan")
+            break
     if not dry_run:
         try:
             audit.sync()
@@ -117,6 +132,29 @@ def loop(
 def sync() -> None:
     """Commit and push reviews/ and ledger/ to the audit repo."""
     audit.sync()
+
+
+@app.command("cooldown")
+def cooldown_cmd(
+    clear: bool = typer.Option(False, "--clear",
+                               help="Clear an active cooldown (debugging only)."),
+) -> None:
+    """Show the global agent rate-limit cooldown.
+
+    Recovery is automatic: the cooldown expires and the next scan resumes on
+    its own. --clear exists only for debugging a stuck timer.
+    """
+    if clear:
+        cooldown.clear()
+        typer.echo("cooldown cleared")
+        return
+    state = cooldown.active()
+    if not state:
+        typer.echo("no active cooldown")
+        return
+    until = datetime.fromtimestamp(state["until_ts"], tz=UTC).astimezone().isoformat(timespec="seconds")
+    typer.echo(f"cooldown until {until} (consecutive={state.get('consecutive')})")
+    typer.echo(f"reason: {state.get('reason')}")
 
 
 @app.command("audit-init")

@@ -48,6 +48,14 @@ def ledger_file() -> Path:
     return data_root() / "ledger" / "ledger.jsonl"
 
 
+# --- ephemeral runtime state ----------------------------------------------
+# Not part of the audit record: a rate-limit cooldown says nothing about what
+# was reviewed, so it lives under logs/ (gitignored) rather than in AUDIT_DIR.
+
+def cooldown_file() -> Path:
+    return LOGS / "cooldown.json"
+
+
 def repo_slug(repo: str) -> tuple[str, str]:
     """Split 'owner/name' into ('owner', 'name'). Raises on malformed input."""
     if repo.count("/") != 1 or not all(repo.split("/")):
