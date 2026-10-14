@@ -55,7 +55,7 @@ def _build_context(repo: str, meta: dict, workdir: Path,
     return ctx_path
 
 
-def _run_manager(repo: str, sha_dir: Path) -> Path:
+def _run_manager(repo: str, sha_dir: Path, review_round: int) -> Path:
     perspectives_dir = sha_dir / "perspectives"
     summary_path = sha_dir / "summary.md"
     summary_path.unlink(missing_ok=True)
@@ -66,6 +66,7 @@ def _run_manager(repo: str, sha_dir: Path) -> Path:
         f"- `REPO` (upstream being reviewed): `{repo}`\n"
         f"- `PERSPECTIVES_DIR`: `{perspectives_dir}`\n"
         f"- `SUMMARY_PATH`: `{summary_path}`\n"
+        f"- `REVIEW_ROUND`: `{review_round}`\n"
     )
     full_prompt = f"{base_prompt}\n\n---\n\n{runtime}\n"
 
@@ -96,6 +97,11 @@ def _run_manager(repo: str, sha_dir: Path) -> Path:
 
 def _generate_review(repo: str, meta: dict, sha_dir: Path) -> Path:
     sha_dir.mkdir(parents=True, exist_ok=True)
+    signature = f"_Posted automatically by **{settings.bot_name}**_"
+    review_round = 1 + sum(
+        signature in (comment.get("body") or "")
+        for comment in meta.get("comments", [])
+    )
     (sha_dir / "metadata.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8",
     )
@@ -103,7 +109,7 @@ def _generate_review(repo: str, meta: dict, sha_dir: Path) -> Path:
     git.checkout_pr(repo, workdir, meta["number"], meta["baseRefName"])
     ctx_path = _build_context(repo, meta, workdir, meta["baseRefName"], sha_dir)
     swarm.run_swarm(repo, meta["number"], workdir, sha_dir, ctx_path)
-    return _run_manager(repo, sha_dir)
+    return _run_manager(repo, sha_dir, review_round)
 
 
 def _record_block(sha_dir: Path, verdict: dict) -> None:

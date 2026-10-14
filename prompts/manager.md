@@ -26,6 +26,8 @@ The harness will append a section listing:
 - ``PERSPECTIVES_DIR`` — the directory containing one ``<name>.md`` per
   agent (e.g. ``security.md``, ``correctness.md``, ``generic-a.md`` …).
 - ``SUMMARY_PATH`` — the file you must create with the combined summary.
+- ``REVIEW_ROUND`` — this review's 1-based round number, counting prior
+  posted comments from this bot on the PR.
 
 Read each file in ``PERSPECTIVES_DIR``. Files containing only
 ``NO_FINDINGS`` (or a `<!-- ... -->` stub followed by ``NO_FINDINGS``)
@@ -70,6 +72,20 @@ issue, or break a core user flow under normal use. Architecture/structure
 preferences, naming, style, missing tests, missing docs, and thin
 demonstration evidence are NOT blocking on their own — they belong under
 "Notes". When you are unsure whether something is a blocker, it is not.>
+
+## Four-round nit cutoff
+
+Use ``REVIEW_ROUND`` to distinguish ongoing review rounds. Rounds 1 through 4
+may include concise, actionable nits under "Notes". Starting with round 5,
+omit nit-level, stylistic, preference, and polish feedback entirely. If only
+such items remain, use "Looks good." and recommend accepting the PR as-is.
+Do not repeat resolved findings or manufacture new nits to fill the section.
+
+This cutoff applies only to nits: continue to report every real defect at any
+round, using the normal severity rules and "Required changes" when warranted.
+Never soften, omit, or relabel a real correctness, security, data-loss, or core-
+flow issue just because four rounds have passed. If real defects remain after
+round 4, report them and omit only the nit-level feedback.
 
 ## Required changes
 <Include this section ONLY when the verdict is "Block — critical issues
