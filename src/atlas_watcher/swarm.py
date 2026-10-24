@@ -45,12 +45,14 @@ class AgentLimitError(RuntimeError):
         self.reset_ts = reset_ts
 
 
-def _limit_from_logs(*paths: Path) -> cooldown.LimitInfo | None:
+def _limit_from_logs(*paths: Path,
+                     anchored: bool = False) -> cooldown.LimitInfo | None:
     for p in paths:
         try:
             if p.is_file():
                 info = cooldown.classify_limit(
-                    p.read_text(encoding="utf-8", errors="ignore")
+                    p.read_text(encoding="utf-8", errors="ignore"),
+                    anchored=anchored,
                 )
                 if info:
                     return info
@@ -351,8 +353,11 @@ def run_single(agent: str, prompt: str, out_file: Path,
     # A rate/session limit exits before producing usable output. Detect it
     # here so the caller aborts instead of parsing (and caching) a garbage
     # result, then raise: this is account-wide infrastructure, not a defect
-    # in the item being reviewed.
-    limit = _limit_from_logs(out_file, log_path)
+    # in the item being reviewed. A successful run's output is real content
+    # that may quote upstream text mentioning a limit, so only a line that
+    # *opens* with the phrase counts then; a failed run is matched leniently.
+    limit = _limit_from_logs(out_file, log_path,
+                             anchored=proc.returncode == 0)
     if limit:
         cooldown.record(limit)
         raise AgentLimitError(limit.reason, limit.reset_ts)

@@ -43,6 +43,10 @@ _LIMIT_PATTERNS = (
 # long. Output past this size is treated as content, not an error.
 _LIMIT_OUTPUT_MAX = 2000
 
+# Anchored matching allows this many characters before the phrase, enough
+# for a prefix like "Error: " or "Claude AI " but not for a quoted mention.
+_ANCHOR_SLACK = 16
+
 # "resets 11am (America/Denver)", "resets 3:30pm (America/Los_Angeles)",
 # "resets 17:00". The timezone is optional; absent, we assume local time.
 _RESET_RE = re.compile(
@@ -57,21 +61,32 @@ class LimitInfo:
     reset_ts: float | None
 
 
-def classify_limit(text: str) -> LimitInfo | None:
+def _line_matches(line: str, anchored: bool) -> bool:
+    for p in _LIMIT_PATTERNS:
+        m = re.search(p, line, re.IGNORECASE)
+        if m and (not anchored or m.start() <= _ANCHOR_SLACK):
+            return True
+    return False
+
+
+def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
     """Return details if ``text`` looks like an agent rate/session limit.
+
+    ``anchored`` requires the phrase to open its line (give or take a short
+    prefix such as "Error: "), which is how a CLI prints its own limit
+    message. Use it for output from an agent that *succeeded*: such output
+    can quote upstream text that mentions a limit — e.g. a triage verdict
+    citing another bot's "usage limit reached" PR comment.
 
     Pure: never writes state. Callers decide whether to record a cooldown.
     """
     if not text or len(text) > _LIMIT_OUTPUT_MAX:
         return None
-    if not any(re.search(p, text, re.IGNORECASE) for p in _LIMIT_PATTERNS):
-        return None
-    reason = ""
     for line in text.splitlines():
-        if any(re.search(p, line, re.IGNORECASE) for p in _LIMIT_PATTERNS):
-            reason = line.strip()
-            break
-    return LimitInfo(reason=reason[:200], reset_ts=_parse_reset(text))
+        if _line_matches(line, anchored):
+            return LimitInfo(reason=line.strip()[:200],
+                             reset_ts=_parse_reset(text))
+    return None
 
 
 def _parse_reset(text: str) -> float | None:
