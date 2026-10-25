@@ -352,7 +352,8 @@ Everything tunable lives in `config.env`. Override locally with
 
 - `REPOS` — comma-separated list of `owner/name` repos to watch. Default
   `sandialabs/atlas-ui-3`. The first entry is the default repo for
-  single-target CLI commands.
+  single-target CLI commands. Put any other repos in `config.local.env`,
+  never in `config.env` (see editing rule 14).
 - `AUDIT_REPO` — GitHub remote of the audit-record repo. Default
   `garland3/ATLAS-WATCHER-LOGS`. **Must stay private** — it contains
   verbatim upstream diffs.
@@ -474,6 +475,22 @@ there (with a default) before referencing them.
     shadows each CLI's login and 401s the whole swarm — with the harness
     still reporting "9 agents ran". Both `_write_runner` and `run_single`
     unset it. If you add a third agent-launch path, unset it there too.
+14. **Never name any other repo — anywhere in this repo or its git history.**
+    This codebase is public. The only repos that may appear by name are
+    `sandialabs/atlas-ui-3` (the default upstream), `garland3/atlas-watcher`
+    (this repo) and `garland3/ATLAS-WATCHER-LOGS` (the audit repo). Every
+    other watched repo — its owner, name, PR/issue numbers, or quoted
+    content — must never land in tracked files *or* in commit messages,
+    branch names, tags or PR descriptions. In practice:
+    - The real `REPOS` list goes in `config.local.env` (gitignored).
+      `config.env` keeps only the default.
+    - When a commit or comment needs an example, write "an upstream PR" or
+      use the default repo — never the item that actually triggered the
+      change.
+    - Before every commit, grep both the staged diff and the commit message
+      for the owner/repo names in `config.local.env`. A leak is not fixed by
+      a follow-up commit, only by rewriting history and force-pushing
+      (confirm that with the user first).
 
 ---
 
