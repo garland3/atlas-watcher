@@ -64,14 +64,18 @@ subcommand.
    and uses its own file-write tool to do so. Stdout/stderr are kept only
    as a debug transcript under `.logs/`.
 4. Once all 9 finish (we block on per-agent sentinel files), a **manager
-   agent** (`dclaude`, prompt: `prompts/manager.md`) reads every
-   perspective file and writes the combined `summary.md`. That is all it
-   does — it has no shell/git step and is not given the audit repo as its
-   cwd, so an agent that has just ingested untrusted upstream text never
-   has a git remote in reach. The harness then scrubs `summary.md` (defense
-   in depth), appends the bot signature, posts the comment upstream via
-   `gh`, and calls `audit.sync()` to publish the whole review folder plus
-   the new ledger row.
+   agent** (the orchestrator; prompt: `prompts/manager.md`) reads every
+   perspective file and writes the combined `summary.md`. Which CLI runs it
+   is set by `MANAGER_AGENT` — any of `dclaude`, `codex`, `cline`,
+   `opencode`, or a name registered in `AGENT_COMMANDS`; switching it is a
+   config-only change. The tracked `config.env` currently uses `dclaude`
+   (the Claude CLI). That is
+   all the manager does — it has no shell/git step and is not given the
+   audit repo as its cwd, so an agent that has just ingested untrusted
+   upstream text never has a git remote in reach. The harness then scrubs
+   `summary.md` (defense in depth), appends the bot signature, posts the
+   comment upstream via `gh`, and calls `audit.sync()` to publish the whole
+   review folder plus the new ledger row.
 5. For each unreviewed **issue**, a single triage agent (`dclaude`) produces:
    - a long internal analysis (archived in the audit repo, never posted), and
    - a short, human-sounding clarifying question, posted **only if** the
@@ -106,8 +110,8 @@ The bot persona is `AGENT-REVIEW-BOT-3`. Posted comments must read like
 output from a single neutral review bot. They must **never**:
 
 - Mention or hint at the underlying model, vendor, or tool: `claude`,
-  `anthropic`, `codex`, `openai`, `gpt`, `chatgpt`, `cline`, `llm`,
-  `language model`, `as an ai`, `i am an ai`, etc.
+  `anthropic`, `codex`, `openai`, `gpt`, `chatgpt`, `cline`, `opencode`,
+  `openrouter`, `llm`, `language model`, `as an ai`, `i am an ai`, etc.
 - Refer to "the perspectives", "the swarm", "the reviewers", or the
   pipeline. Each comment is one voice.
 - Apologize for being automated, refuse on policy grounds, or include
@@ -361,9 +365,19 @@ Everything tunable lives in `config.env`. Override locally with
   code repo root; empty means `<code root>/audit-data`. Default
   `../ATLAS-WATCHER-LOGS`.
 - `BOT_NAME` — signature line on every comment. Default `AGENT-REVIEW-BOT-3`.
-- `DCLAUDE_CMD`, `CODEX_CMD`, `CLINE_CMD` — the agent CLIs. Override if your
-  binary names differ. `dclaude` defaults to
-  `claude --dangerously-skip-permissions --print`.
+- `MANAGER_AGENT` — which CLI runs the manager (the orchestrator that writes
+  the combined summary). One of the built-ins (`dclaude`, `codex`, `cline`,
+  `opencode`) or a name registered in `AGENT_COMMANDS`. Switching it requires
+  no code change. The tracked default is `dclaude`.
+- `DCLAUDE_CMD`, `CODEX_CMD`, `CLINE_CMD`, `OPENCODE_CMD` — the agent CLIs.
+  Override if your binary names differ. `dclaude` defaults to
+  `claude --dangerously-skip-permissions --print`; `opencode` defaults to
+  `opencode run --model openrouter/openrouter/auto --auto` (OpenRouter Auto
+  Router).
+- `AGENT_COMMANDS` — optional JSON object mapping extra agent names to CLI
+  commands, e.g. `{"gemini": "gemini --approval-mode yolo"}`. A key may also
+  shadow a built-in to repoint it. This is how "something else" becomes an
+  orchestrator with a config-only change.
 - `AGENT_TIMEOUT_SECS` — per-agent wall-clock cap. Default 1800.
 - `POLL_INTERVAL_SECS` — sleep between passes in `loop` mode. Default
   900 (15 min — matches the recommended cron cadence).
@@ -498,7 +512,8 @@ there (with a default) before referencing them.
 
 - The watcher checks out arbitrary upstream PR code and runs AI agents over
   it. Those agents typically run with broad filesystem access (`dclaude`
-  defaults to `--dangerously-skip-permissions`). Do **not** add untrusted
+  defaults to `--dangerously-skip-permissions`; `opencode` runs with
+  `--auto`). Do **not** add untrusted
   upstream repos to `REPOS` — every entry there is treated as a
   trust-equivalent target.
 - The bot posts as whatever GitHub user `gh` is authenticated as. The

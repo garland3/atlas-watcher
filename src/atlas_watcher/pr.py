@@ -71,8 +71,10 @@ def _run_manager(repo: str, sha_dir: Path, review_round: int) -> Path:
     full_prompt = f"{base_prompt}\n\n---\n\n{runtime}\n"
 
     log_path = sha_dir / "manager.log"
+    agent = settings.manager_agent
+    log(f"manager agent: {agent}")
     rc = swarm.run_single(
-        "dclaude", full_prompt,
+        agent, full_prompt,
         out_file=sha_dir / "manager.stdout.log",
         log_file=log_path,
         # The manager only reads PERSPECTIVES_DIR and writes SUMMARY_PATH, both
@@ -85,7 +87,7 @@ def _run_manager(repo: str, sha_dir: Path, review_round: int) -> Path:
 
     if not summary_path.is_file() or summary_path.stat().st_size == 0:
         raise RuntimeError(
-            f"manager did not produce {summary_path}; see {log_path}"
+            f"manager ({agent}) did not produce {summary_path}; see {log_path}"
         )
 
     summary_path.write_text(

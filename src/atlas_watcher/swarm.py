@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import cooldown
-from .config import settings
+from .config import AGENT_COMMAND_FIELDS, settings
 from .log import log
 from .paths import PROMPTS
 
@@ -83,11 +83,21 @@ PERSPECTIVES: tuple[Perspective, ...] = (
 
 
 def _agent_cmd(agent: str) -> str:
-    match agent:
-        case "dclaude": return settings.dclaude_cmd
-        case "codex":   return settings.codex_cmd
-        case "cline":   return settings.cline_cmd
-        case _: raise ValueError(f"unknown agent: {agent}")
+    """Resolve an agent name to its CLI command.
+
+    AGENT_COMMANDS wins over the built-ins, so an operator can repoint an
+    existing name or register a new CLI entirely from config.
+    """
+    override = settings.agent_commands.get(agent)
+    if override:
+        return override
+    attr = AGENT_COMMAND_FIELDS.get(agent)
+    if attr:
+        return getattr(settings, attr)
+    known = sorted(set(AGENT_COMMAND_FIELDS) | set(settings.agent_commands))
+    raise ValueError(
+        f"unknown agent: {agent!r}; built-ins/config: {', '.join(known)}"
+    )
 
 
 def _output_instructions(findings_path: Path, perspective_name: str) -> str:

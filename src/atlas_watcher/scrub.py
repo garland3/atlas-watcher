@@ -13,6 +13,8 @@ _FORBIDDEN_WORDS = (
     r"gpt",
     r"chatgpt",
     r"cline",
+    r"opencode",
+    r"openrouter",
 )
 # Trailing "s?" catches plurals/org forms ("anthropics", "codexes" → "codex"
 # already matches); \b handles possessives ("claude's") on its own.

@@ -3,10 +3,20 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .paths import ROOT
+
+
+# Built-in agent name -> Settings field holding its CLI command. AGENT_COMMANDS
+# can override any of these or add new names, all from config.
+AGENT_COMMAND_FIELDS: dict[str, str] = {
+    "dclaude": "dclaude_cmd",
+    "codex": "codex_cmd",
+    "cline": "cline_cmd",
+    "opencode": "opencode_cmd",
+}
 
 
 class Settings(BaseSettings):
@@ -31,11 +41,26 @@ class Settings(BaseSettings):
     audit_dir: str = ""
     bot_name: str = "AGENT-REVIEW-BOT-3"
 
+    # Which CLI runs the manager (the orchestrator that reads the perspective
+    # reports and writes the final summary). Use any built-in below, or a name
+    # registered in AGENT_COMMANDS. Changing this is all it takes to switch
+    # the orchestrator between claude/codex/cline/opencode/anything else.
+    manager_agent: str = "dclaude"
+
     dclaude_cmd: str = "claude --dangerously-skip-permissions --print"
     codex_cmd: str = "codex exec"
     # cline reads the prompt from stdin; it has no --print flag (that was a
     # copy of the dclaude invocation and made every generic-b agent exit 1).
     cline_cmd: str = "cline --auto-approve true"
+    # OpenCode reads the prompt from stdin. The model id is provider/model,
+    # so OpenRouter's Auto Router is "openrouter/openrouter/auto".
+    opencode_cmd: str = "opencode run --model openrouter/openrouter/auto --auto"
+
+    # Extra agent commands as a JSON object, e.g.
+    #   AGENT_COMMANDS={"gemini": "gemini --approval-mode yolo"}
+    # Keys may also shadow a built-in, so the same CLI can be repointed at a
+    # different binary/flags without touching the code.
+    agent_commands: dict[str, str] = {}
 
     # Agents authenticate through their own CLI login. An ANTHROPIC_API_KEY in
     # the inherited environment silently takes precedence over that login, so
@@ -98,6 +123,17 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [r.strip() for r in v.split(",") if r.strip()]
         return v
+
+    @model_validator(mode="after")
+    def _check_manager_agent(self):
+        known = set(AGENT_COMMAND_FIELDS) | set(self.agent_commands)
+        if self.manager_agent not in known:
+            raise ValueError(
+                f"MANAGER_AGENT={self.manager_agent!r} is not a known agent; "
+                f"use one of {', '.join(sorted(known))} or add it to "
+                f"AGENT_COMMANDS"
+            )
+        return self
 
     @property
     def default_repo(self) -> str:

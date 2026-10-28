@@ -71,8 +71,8 @@ Notes:
 - The watcher writes structured logs to stderr; cron captures stderr into
   `logs/cron.log` (gitignored). Rotate it with `logrotate` if it grows.
 - Cron jobs run with a minimal environment. If your `uv`, `gh`, `tmux`,
-  `claude`, `codex`, or `cline` binaries live in user-specific paths, set
-  `PATH` at the top of the crontab:
+  `claude`, `codex`, `cline`, or `opencode` binaries live in user-specific
+  paths, set `PATH` at the top of the crontab:
   ```
   PATH=/home/garlan/.local/bin:/home/garlan/.nvm/versions/node/v22.22.1/bin:/usr/bin:/bin
   ```
@@ -107,7 +107,13 @@ header of that file for every knob. Notable ones:
 - `AUDIT_DIR` — local path of that repo (default `../ATLAS-WATCHER-LOGS`).
   Bootstrap it once with `uv run atlas-watcher audit-init`.
 - `BOT_NAME` — comment-body signature.
-- `DCLAUDE_CMD`, `CODEX_CMD`, `CLINE_CMD` — agent CLI commands.
+- `DCLAUDE_CMD`, `CODEX_CMD`, `CLINE_CMD`, `OPENCODE_CMD` — agent CLI
+  commands.
+- `MANAGER_AGENT` — CLI that runs the manager/orchestrator (`dclaude`,
+  `codex`, `cline`, `opencode`, or any name registered in `AGENT_COMMANDS`).
+  The tracked default is `dclaude` (Claude CLI).
+- `AGENT_COMMANDS` — optional JSON map of extra agent names to commands, so
+  a new CLI can become the orchestrator without a code change.
 - `AGENT_TIMEOUT_SECS` — per-agent wall-clock cap (default 1800s).
 - `POLL_INTERVAL_SECS` — sleep between passes in `loop` mode (default 900s
   / 15 min, matching the cron cadence).
