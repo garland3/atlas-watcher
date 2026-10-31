@@ -24,7 +24,7 @@ _COMMENT_RE = re.compile(
 
 
 def _build_context(repo: str, meta: dict) -> str:
-    labels = ", ".join(l["name"] for l in meta.get("labels", []))
+    labels = ", ".join(label["name"] for label in meta.get("labels", []))
     parts = [
         f"## {repo} Issue #{meta['number']} — {meta['title']}\n",
         f"**URL:** {meta['url']}",
@@ -54,8 +54,11 @@ def _generate_triage(repo: str, meta: dict, snap_dir: Path) -> None:
     )
 
     raw_path = snap_dir / "triage.raw.md"
-    swarm.run_single("dclaude", full, raw_path,
-                     log_file=snap_dir / "triage.log")
+    result = swarm.run_role("issue-triage", full, raw_path,
+                            log_file=snap_dir / "triage.log",
+                            raise_on_failure=False)
+    audit.merge_ran(snap_dir, "issue_triage",
+                    {"agent": result.agent, "vendor": result.vendor})
     raw = raw_path.read_text(encoding="utf-8")
 
     a_match = _ANALYSIS_RE.search(raw)
@@ -106,8 +109,11 @@ def process(repo: str, issue_number: int, dry_run: bool = False) -> str:
         return _process(repo, meta, dry_run)
     except Exception as e:
         if not dry_run:
-            # Account-wide rate limit: defer, don't burn the retry budget.
-            status = "deferred" if isinstance(e, swarm.AgentLimitError) else "failed"
+            # A rate/session limit (or a vendor-diversity shortfall) is
+            # infrastructure: defer, don't burn the retry budget. The
+            # per-vendor cooldown gates the next attempt.
+            status = ("deferred" if isinstance(e, swarm.DEFERRED_ERRORS)
+                      else "failed")
             try:
                 ledger.append(repo, "issue", issue_number, key,
                               status=status, error=repr(e)[:500])
@@ -148,6 +154,14 @@ def _process(repo: str, meta: dict, dry_run: bool) -> str:
     else:
         _generate_triage(repo, meta, snap_dir)
 
+    # Which agent/vendor produced the security verdict (travels in the
+    # cached security.json, so this also works on a reused verdict).
+    audit.merge_ran(snap_dir, "security_triage", {
+        "agent": verdict["model_verdict"].get("agent"),
+        "vendor": verdict["model_verdict"].get("vendor"),
+        "fallback": verdict["model_verdict"].get("agent_fallback", False),
+    })
+
     comment_text = comment_path.read_text(encoding="utf-8").strip()
     should_post = bool(comment_text) and comment_text.upper() != "NO_COMMENT"
 
@@ -181,5 +195,14 @@ def _process(repo: str, meta: dict, dry_run: bool) -> str:
             encoding="utf-8",
         )
 
-    ledger.append(repo, "issue", issue_number, key)
+    # Record the triage agent's vendor on the ledger row (no swarm here, so
+    # the "vendor list" is the single triage vendor when one is recorded).
+    try:
+        ran = json.loads((snap_dir / "metadata.json").read_text(
+            encoding="utf-8")).get("ran", {})
+        triage = ran.get("issue_triage") or {}
+    except (OSError, json.JSONDecodeError):
+        triage = {}
+    triage_vendor = [triage["vendor"]] if triage.get("vendor") else []
+    ledger.append(repo, "issue", issue_number, key, vendors=triage_vendor)
     return "done"

@@ -1,14 +1,29 @@
-"""Global cooldown after a detected agent rate/session limit.
+"""Per-agent (per-vendor) cooldown after a detected rate/session limit.
 
-A rate limit is account-wide, not per item: when one agent reports it, every
-other agent will hit the same wall until it resets. The watcher runs
-unattended on cron, so recovery must be automatic — this module makes the
-whole pass skip itself until the limit expires, rather than launching swarms
-that are guaranteed to fail and recording failures the item did not cause.
+A rate limit is account-wide, and accounts belong to vendors: when one
+vendor's agent reports a limit, every OTHER vendor can keep working. So the
+cooldown is keyed by **vendor** (``anthropic``, ``openai``, ``xai``, ...),
+not held as one global pause:
+
+- a limit on vendor X pauses only X;
+- a role pauses only when *every* candidate for it is cooling down, and it
+  resumes at the earliest reset among them (see
+  :func:`atlas_watcher.agents.pick`);
+- a scan pass stops only when no role can run at all.
 
 The cooldown is runtime state, not record: it lives in a gitignored file
 under ``logs/`` (see :func:`paths.cooldown_file`). It is never written to the
 audit repo, and it expires on its own, so no operator has to clear it.
+
+State format (v2)::
+
+    {"agents": {"<vendor>": {"until_ts": ..., "set_at": ...,
+                             "consecutive": N, "reason": "..."}}}
+
+A legacy v1 file (a single flat state from before per-agent cooldowns) is
+honored as a cooldown on the reserved vendor key ``"*"`` — i.e. the old
+global pause keeps pausing everything until it expires, and new records are
+per-vendor from then on.
 """
 from __future__ import annotations
 
@@ -23,10 +38,14 @@ from .config import settings
 from .log import log
 from .paths import cooldown_file
 
+# Reserved vendor key for a pre-per-agent (global) cooldown read from a
+# legacy v1 state file. It cools every vendor until it expires.
+LEGACY_ALL = "*"
+
 # Phrases that mean "the account is capped", case-insensitive. Kept specific:
 # a rate-limit message is the whole (short) output of a failed agent, whereas
 # a successful summary or findings file may legitimately *discuss* rate
-# limiting. The size guard in :func:`classify_limit` and the "only failed
+# limiting. The tail-scan in :func:`classify_limit` and the "only failed
 # agents" rule in the swarm are what keep this from misfiring on reviewed
 # code that talks about 429s.
 # The window name is free-form because the CLIs keep renaming it: "session",
@@ -53,8 +72,20 @@ _FALLBACK_RETRY_RE = re.compile(
 )
 
 # A real limit message is a line or two; a genuine summary/findings file is
-# long. Output past this size is treated as content, not an error.
-_LIMIT_OUTPUT_MAX = 2000
+# long. Output past this size is treated as content, not an error — except
+# that a *failed* agent's log is scanned in its tail (see classify_limit),
+# because some CLIs echo the whole prompt into the log before failing, which
+# would otherwise bury the limit message past this guard.
+LIMIT_OUTPUT_MAX = 2000
+
+# How many lines at the END of a failed agent's log count as "the CLI's own
+# error" for reset-trust purposes (see classify_limit): a stated reset is
+# honored out to the weekly ceiling only when the limit line sits within
+# this many lines of the log's end. A limit-shaped line quoted earlier in
+# the output — tool chatter, a file the agent read — can state any reset it
+# likes; downgrading that match to weak caps the pause at the ordinary
+# backoff ceiling instead of parking a vendor for days on a planted claim.
+_RESET_TAIL_LINES = 6
 
 # Anchored matching allows this many characters before the phrase, enough
 # for a prefix like "Error: " or "Claude AI " but not for a quoted mention.
@@ -87,19 +118,100 @@ _RESET_IN_RE = re.compile(
 class LimitInfo:
     reason: str
     reset_ts: float | None
+    # True when the match came from the explicit limit wordings (the CLIs'
+    # real messages, sitting in the last few lines of the log — see
+    # _RESET_TAIL_LINES) rather than the weak cap-word+retry-hint fallback.
+    # A *stated* reset is honored out to agent_limit_reset_max_secs (8
+    # days, a weekly limit) only for strong matches; a weak match's reset
+    # is capped at the ordinary backoff ceiling, because a guess — or a
+    # line planted in the agent's output — must not be able to park a
+    # vendor for days.
+    strong: bool = True
 
 
-def _line_matches(line: str, anchored: bool) -> bool:
+def normalize_line(line: str) -> str:
+    """Whitespace-normalized form of a log line, for echo comparison."""
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def echo_lines(exclude_text: str | None) -> frozenset[str]:
+    """Whitespace-normalized lines of the text we ourselves sent to the agent.
+
+    Some CLIs echo their input (the whole prompt, diff included) into the
+    log before failing. A limit-shaped line that appears inside that echo
+    is upstream content, not the CLI's own error — acting on it would let a
+    PR plant a cooldown (or force failover) for a vendor. The match is
+    WHOLE-LINE: a log line is ignored only when its normalized form exactly
+    equals one of the prompt's lines. A CLI's own message gets a prefix
+    ("ERROR: …") and never equals a prompt line, so real limits still match;
+    and this repo's own docs (which legitimately contain the phrase on their
+    own line) suppress only the exact echoed copy, not the CLI's error.
+    """
+    if not exclude_text:
+        return frozenset()
+    return frozenset(normalize_line(line)
+                     for line in exclude_text.splitlines())
+
+
+def log_tail(text: str) -> str:
+    """The last ``LIMIT_OUTPUT_MAX`` characters of a failed agent's log.
+
+    Some CLIs echo the whole prompt — diff included — into their log before
+    failing, so the CLI's own error sits at the end of an otherwise huge
+    log, past the size guard. The cut can land mid-line: the slice's first
+    line would then be a partial copy of an echoed prompt line (e.g. "…
+    aise Unauthorized") whose normalized form equals no prompt line, so it
+    would slip past the echo filter and let upstream text read as the
+    CLI's own error. The partial line is dropped — the slice's only
+    incomplete line is its first, and the CLI's own message sits at the
+    end of the log.
+    """
+    if len(text) <= LIMIT_OUTPUT_MAX:
+        return text
+    cut = len(text) - LIMIT_OUTPUT_MAX
+    mid_line_cut = text[cut - 1] != "\n"
+    text = text[cut:]
+    if mid_line_cut and "\n" in text:
+        text = text[text.index("\n") + 1:]
+    return text
+
+
+def filtered_lines(text: str, exclude_text: str | None) -> list[str]:
+    """``text``'s lines minus echoed input (see :func:`echo_lines`)."""
+    echo = echo_lines(exclude_text)
+    lines = text.splitlines()
+    if not echo:
+        return lines
+    return [line for line in lines if normalize_line(line) not in echo]
+
+
+def filtered_tail(text: str, exclude_text: str | None) -> str:
+    """The scan window for a failed agent's log: its tail, minus echo.
+
+    Shared by BOTH classifiers — :func:`classify_limit` (limit signatures)
+    and the swarm's auth classifier (auth signatures) — so a partial line
+    left by the tail cut, or an echoed prompt line, is handled identically
+    no matter which signature set scans it (see :func:`log_tail` and
+    :func:`echo_lines` for each half's rationale).
+    """
+    return "\n".join(filtered_lines(log_tail(text), exclude_text))
+
+
+def _line_match(line: str, anchored: bool) -> tuple[bool, bool]:
+    """(matched, strong) for one log line."""
     for p in _LIMIT_PATTERNS:
         m = re.search(p, line, re.IGNORECASE)
         if m and (not anchored or m.start() <= _ANCHOR_SLACK):
-            return True
+            return True, True
     if anchored:
-        return False
-    return bool(_FALLBACK_CAP_RE.search(line) and _FALLBACK_RETRY_RE.search(line))
+        return False, False
+    if _FALLBACK_CAP_RE.search(line) and _FALLBACK_RETRY_RE.search(line):
+        return True, False
+    return False, False
 
 
-def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
+def classify_limit(text: str, anchored: bool = False, *,
+                   exclude_text: str | None = None) -> LimitInfo | None:
     """Return details if ``text`` looks like an agent rate/session limit.
 
     ``anchored`` requires the phrase to open its line (give or take a short
@@ -109,15 +221,66 @@ def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
     citing another bot's "usage limit reached" PR comment. Unanchored
     matching (failed agents only) also applies the unknown-wording fallback.
 
+    Long text is handled differently by mode:
+
+    - *failed* agents (unanchored): only the **tail** is scanned. Some CLIs
+      echo the whole prompt into their log before failing — codex does — so
+      the limit message sits at the end of an otherwise huge log, past the
+      size guard. Scanning the tail finds it without exposing the scanner to
+      quoted limit talk in the middle of real content.
+    - *successful* agents (anchored): long output is not scanned at all. A
+      successful run's output is review content; the anchored rule alone is
+      not enough reason to regex thousands of characters of it.
+
+    The tail cut and the echo filter are the shared :func:`log_tail` /
+    :func:`filtered_lines` helpers, so the auth classifier (which scans the
+    same window for different signatures) handles partial and echoed lines
+    exactly the same way.
+
+    ``exclude_text`` (the prompt we sent, when the caller has it) marks lines
+    that are echoed input: a log line whose normalized form exactly equals a
+    prompt line is skipped, and the reset time is parsed only from surviving
+    match lines — so upstream text cannot plant a multi-day cooldown by
+    quoting one in a diff.
+
     Pure: never writes state. Callers decide whether to record a cooldown.
     """
-    if not text or len(text) > _LIMIT_OUTPUT_MAX:
+    if not text:
         return None
-    for line in text.splitlines():
-        if _line_matches(line, anchored):
-            return LimitInfo(reason=line.strip()[:200],
-                             reset_ts=_parse_reset(text))
-    return None
+    if len(text) > LIMIT_OUTPUT_MAX:
+        if anchored:
+            return None
+        text = log_tail(text)
+    lines = filtered_lines(text, exclude_text)
+    matched: list[str] = []
+    first_match = len(lines)
+    strong = False
+    for i, line in enumerate(lines):
+        hit, is_strong = _line_match(line, anchored)
+        if not hit:
+            continue
+        if not matched:
+            # The CLI often states the reset on the line after the limit
+            # ("usage limit reached.\nResets 3pm (America/Denver)") — parse
+            # from the matched line plus that one neighbor, never the whole
+            # tail (the tail may otherwise be echoed prompt/diff text).
+            matched = [line, lines[i + 1] if i + 1 < len(lines) else ""]
+            first_match = i
+        strong = strong or is_strong
+    if not matched:
+        return None
+    # A *stated* reset is only honored out to the weekly ceiling when the
+    # limit line sits in the last few lines of the log — where a CLI prints
+    # its own error. A strong-wording limit quoted earlier in tool output
+    # (a file the agent read, a diff it echoed) can state any reset it
+    # likes; downgrading it to a weak match caps the pause at the ordinary
+    # backoff ceiling instead of parking the vendor for days on a claim
+    # this scanner cannot verify (see _RESET_TAIL_LINES).
+    if first_match < len(lines) - _RESET_TAIL_LINES:
+        strong = False
+    return LimitInfo(reason=matched[0].strip()[:200],
+                     reset_ts=_parse_reset("\n".join(matched)),
+                     strong=strong)
 
 
 def _parse_reset(text: str, now: datetime | None = None) -> float | None:
@@ -179,39 +342,82 @@ def _ts(dt: datetime) -> float:
     return (dt if dt.tzinfo else dt.astimezone()).timestamp()
 
 
-def read() -> dict | None:
+def _load() -> dict[str, dict]:
+    """All stored cooldown states keyed by vendor, honoring the v1 format."""
     path = cooldown_file()
     if not path.is_file():
-        return None
+        return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    agents = raw.get("agents")
+    if isinstance(agents, dict):
+        return {str(k): v for k, v in agents.items() if isinstance(v, dict)}
+    # Legacy v1: one flat global state. Keep it cooling everything until it
+    # expires rather than silently dropping a pause that is still in force.
+    if "until_ts" in raw:
+        return {LEGACY_ALL: raw}
+    return {}
 
 
-def active() -> dict | None:
-    """The cooldown if it is still in force; expired state self-clears."""
-    state = read()
-    if not state:
-        return None
+def _save(states: dict[str, dict]) -> None:
+    path = cooldown_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"agents": states}, indent=2), encoding="utf-8")
+
+
+def _live(state: dict) -> dict | None:
+    """The state if it is still in force; expired state self-clears."""
     if float(state.get("until_ts", 0)) <= time.time():
-        clear()
         return None
     return state
 
 
-def record(limit: LimitInfo) -> dict:
-    """Persist a cooldown for a detected limit and return the new state.
+def active_for(vendor: str) -> dict | None:
+    """The cooldown state for ``vendor`` if one is in force, else None.
+
+    Also honors a legacy global (``"*"``) cooldown.
+    """
+    states = _load()
+    for key in (vendor, LEGACY_ALL):
+        state = states.get(key)
+        if state and (live := _live(state)):
+            return live
+    return None
+
+
+def active_all() -> dict[str, dict]:
+    """Every cooldown still in force, keyed by vendor (legacy one under "*")."""
+    states = _load()
+    live = {vendor: s for vendor, s in states.items() if _live(s)}
+    if len(live) != len(states):
+        _save(live)
+    return live
+
+
+def record(vendor: str, limit: LimitInfo) -> dict:
+    """Persist a cooldown for ``vendor`` and return the new state.
 
     Honors the agent's stated reset time when it parses, otherwise backs off
     exponentially by consecutive limit hits (base * 2^(n-1)), capped both
-    ways. The fallback cap matters because a guess must not park the watcher
-    for a day: retrying early only re-detects the limit and extends. A stated
-    reset gets the longer ``agent_limit_reset_max_secs`` ceiling, since a
-    weekly limit really does last days.
+    ways. The fallback cap matters because a guess must not park the vendor
+    for a day: retrying early only re-detects the limit and extends. A
+    stated reset from a *strong* match — a known CLI limit wording sitting
+    in the last few lines of the log, where a CLI prints its own error (see
+    classify_limit) — gets the longer ``agent_limit_reset_max_secs``
+    ceiling, since a weekly limit really does last days; a weak
+    (fallback-heuristic) match, or a strong wording quoted earlier in the
+    output, is capped at the ordinary backoff ceiling — an unverifiable
+    claim must not be able to park a vendor for days.
+
+    Only ``vendor`` is paused. Roles running on other vendors keep running.
     """
     now = time.time()
-    prev = read()
+    states = _load()
+    prev = states.get(vendor)
     consecutive = 1
     if prev and now - float(prev.get("set_at", 0)) < settings.agent_limit_backoff_max_secs:
         consecutive = int(prev.get("consecutive", 0)) + 1
@@ -220,7 +426,9 @@ def record(limit: LimitInfo) -> dict:
         settings.agent_limit_backoff_max_secs,
     )
     if limit.reset_ts and limit.reset_ts > now:
-        until = min(limit.reset_ts, now + settings.agent_limit_reset_max_secs)
+        ceiling = (settings.agent_limit_reset_max_secs if limit.strong
+                   else settings.agent_limit_backoff_max_secs)
+        until = min(limit.reset_ts, now + ceiling)
     else:
         until = min(now + fallback, now + settings.agent_limit_backoff_max_secs)
     state = {
@@ -229,12 +437,35 @@ def record(limit: LimitInfo) -> dict:
         "consecutive": consecutive,
         "reason": limit.reason,
     }
-    cooldown_file().parent.mkdir(parents=True, exist_ok=True)
-    cooldown_file().write_text(json.dumps(state, indent=2), encoding="utf-8")
-    log(f"agent limit detected ({limit.reason!r}); pausing until "
+    states[vendor] = state
+    _save(states)
+    log(f"agent limit detected on vendor {vendor!r} ({limit.reason!r}); "
+        f"pausing {vendor} until "
         f"{datetime.fromtimestamp(until, tz=UTC).astimezone().isoformat(timespec='seconds')} "
         f"(consecutive={consecutive})")
     return state
+
+
+def earliest_reset(vendors) -> float | None:
+    """When the earliest of these vendors' cooldowns lifts, or None.
+
+    A role blocked on cooldown resumes at the earliest reset among its
+    candidates; a whole pass resumes when the earliest blocked role can run.
+
+    Liveness is checked on every key exactly as ``active_for`` does: an
+    expired per-vendor entry must not hide a still-live legacy ("*")
+    cooldown — the error would otherwise report "earliest reset unknown"
+    while a global cooldown is still pausing everything.
+    """
+    states = _load()
+    resets = []
+    for vendor in vendors:
+        for key in (vendor, LEGACY_ALL):
+            state = states.get(key)
+            if state and (live := _live(state)):
+                resets.append(float(live["until_ts"]))
+                break
+    return min(resets) if resets else None
 
 
 def clear() -> None:
