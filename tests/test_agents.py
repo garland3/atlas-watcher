@@ -10,16 +10,6 @@ from atlas_watcher.config import AgentCommand
 from conftest import GROK
 
 
-@pytest.fixture()
-def fake_binaries(monkeypatch):
-    """Declare which fake agent names have a binary present. Replaces the
-    real (cached) probe entirely, so the test never shells out."""
-    present: set[str] = set()
-    monkeypatch.setattr(agents, "binary_available",
-                        lambda agent: agent in present)
-    return present
-
-
 def test_vendor_of_builtins_and_overrides(patch_settings):
     patch_settings(agent_commands={
         "opencode-grok": AgentCommand(
@@ -129,30 +119,40 @@ def test_pick_first_choice_never_reorders_for_diversity(
     assert agent == "dclaude"
 
 
-def test_block_reason_classifies_the_block(patch_settings, fake_binaries,
-                                           cooldown_file):
-    patch_settings(perspective_agents=["dclaude"],
-                   issue_triage_agents=["dclaude"],
-                   security_triage_agents=["dclaude"],
-                   generic_a_agents=["codex"], generic_b_agents=["cline"],
-                   manager_agents=["dclaude"])
-    fake_binaries.update({"dclaude", "codex", "cline"})
-    assert agents.block_reason(agents.ALL_ROLES) is None
-    cooldown.record("anthropic", cooldown.LimitInfo("usage limit reached", None))
-    assert agents.block_reason(agents.ALL_ROLES) == "cooldown"
-    # A role blocked purely by a missing binary is a config error, and wins
-    # only when nothing is self-healing.
-    fake_binaries.discard("cline")
-    cooldown.clear()
-    assert agents.block_reason(agents.ALL_ROLES) == "missing"
-
-
-def test_earliest_reset_spans_the_blocked_roles(patch_settings, cooldown_file):
+def test_roles_ready_at_is_the_latest_role_ready_time(
+        patch_settings, fake_binaries, cooldown_file):
+    # The set is ready when EVERY role has a free candidate: the latest of
+    # the per-role earliest resets, not the global earliest.
     patch_settings(perspective_agents=["dclaude"], generic_a_agents=["codex"],
                    generic_b_agents=["cline"], manager_agents=["dclaude"],
                    security_triage_agents=["dclaude"],
                    issue_triage_agents=["dclaude"])
+    fake_binaries.update({"dclaude", "codex", "cline"})
+    cooldown.record("anthropic", cooldown.LimitInfo("usage limit reached",
+                                                    time.time() + 7200))
     cooldown.record("openai", cooldown.LimitInfo("quota exceeded",
                                                  time.time() + 300))
-    soonest = agents.earliest_reset(agents.ALL_ROLES)
-    assert abs(soonest - (time.time() + 300)) < 5
+    ready = agents.roles_ready_at(agents.ALL_ROLES)
+    assert abs(ready - (time.time() + 7200)) < 5  # anthropic lifts last
+
+
+def test_roles_ready_at_ignores_uncooled_roles(patch_settings, fake_binaries,
+                                               cooldown_file):
+    patch_settings(perspective_agents=["dclaude"], generic_a_agents=["codex"],
+                   generic_b_agents=["cline"], manager_agents=["dclaude"],
+                   security_triage_agents=["dclaude"],
+                   issue_triage_agents=["dclaude"])
+    fake_binaries.update({"dclaude", "codex", "cline"})
+    assert agents.roles_ready_at(agents.ALL_ROLES) is None
+    cooldown.record("openai", cooldown.LimitInfo("quota exceeded",
+                                                 time.time() + 300))
+    ready = agents.roles_ready_at(agents.ALL_ROLES)
+    assert abs(ready - (time.time() + 300)) < 5
+
+
+def test_refresh_binaries_forgets_the_cache(patch_settings):
+    patch_settings()
+    agents.binary_available("codex")   # populates the real lru_cache
+    assert agents.binary_available.cache_info().currsize >= 1
+    agents.refresh_binaries()
+    assert agents.binary_available.cache_info().currsize == 0

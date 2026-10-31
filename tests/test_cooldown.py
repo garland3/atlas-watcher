@@ -74,6 +74,25 @@ def test_earliest_reset_ignores_uncooled_vendors(cooldown_file):
     assert cooldown.earliest_reset(["xai"]) is None
 
 
+def test_weak_match_reset_is_capped_at_the_backoff_ceiling(
+        cooldown_file, patch_settings):
+    import time as t
+    patch_settings(agent_limit_backoff_max_secs=21600,
+                   agent_limit_reset_max_secs=691200)
+    # A fallback-heuristic (weak) match claiming a far-future reset must not
+    # park the vendor for days.
+    weak = cooldown.classify_limit(
+        "you've burned your credits — try again at Nov 30, 5pm")
+    assert weak is not None and weak.strong is False
+    state = cooldown.record("anthropic", weak)
+    assert state["until_ts"] < t.time() + 21600 + 5
+
+    strong = cooldown.classify_limit("usage limit reached. resets Nov 30, 5pm")
+    assert strong is not None and strong.strong is True
+    state = cooldown.record("openai", strong)
+    assert state["until_ts"] > t.time() + 21600
+
+
 def test_limit_found_in_the_tail_of_a_huge_failed_log():
     # codex echoes the whole prompt into its log; the limit message is at
     # the very end, far past the size guard.
@@ -83,6 +102,36 @@ def test_limit_found_in_the_tail_of_a_huge_failed_log():
     assert info is not None
     assert "usage limit reached" in info.reason
     assert info.reset_ts is not None
+
+
+def test_echoed_prompt_lines_do_not_plant_a_cooldown():
+    # An upstream PR whose diff contains a fake limit message: the CLI
+    # echoes the prompt (diff included) and dies. The echo must not be
+    # mistaken for the CLI's own error.
+    planted = "+Our retry budget was exhausted (quota exceeded) — resets Nov 30\n"
+    prompt = "# PR context\n" + planted * 50
+    log = prompt + "ERROR: exit code 1\n"
+    assert cooldown.classify_limit(log, anchored=False,
+                                   exclude_text=prompt) is None
+    # Without the exclusion (legacy behavior) it WOULD match — this is what
+    # the filter is for.
+    assert cooldown.classify_limit(log, anchored=False) is not None
+
+
+def test_reset_is_parsed_from_the_match_line_not_the_whole_tail():
+    # A fake reset deep in the echo must not be honored even when a REAL
+    # limit line elsewhere triggers the match.
+    prompt = ("some diff line\n+quota exceeded, resets Dec 25, 9am\n" * 30)
+    log = prompt + "ERROR: usage limit reached\ntry again at 3:30pm\n"
+    info = cooldown.classify_limit(log, anchored=False, exclude_text=prompt)
+    assert info is not None
+    assert info.reset_ts is not None
+    # The parsed reset must come from the real message (≈ today 3:30pm),
+    # not from Dec 25 in the echo.
+    import datetime as dt
+    hours_ahead = (dt.datetime.fromtimestamp(info.reset_ts)
+                   - dt.datetime.now()).total_seconds() / 3600
+    assert hours_ahead < 30
 
 
 def test_long_successful_output_is_not_scanned():

@@ -2,11 +2,18 @@
 from atlas_watcher.scrub import scrub_identity
 
 
-def test_new_vendor_terms_are_scrubbed():
-    assert "grok" not in scrub_identity("ran on grok for this review").lower()
-    assert "xai" not in scrub_identity("the xai endpoint said").lower()
-    assert "x.ai" not in scrub_identity("see https://x.ai/docs").lower()
-    assert "grok" not in scrub_identity("model grok-4.7 reviewed it").lower()
+def test_identity_shaped_xai_terms_are_scrubbed():
+    assert "grok-4.7" not in scrub_identity("model grok-4.7 reviewed it")
+    assert "grok" not in scrub_identity("model grok4 reviewed it")
+    assert "x.ai" not in scrub_identity("see https://x.ai/docs")
+    assert "x-ai" not in scrub_identity("openrouter/x-ai/grok-4.7")
+
+
+def test_ordinary_uses_of_grok_and_xai_survive():
+    # "grok" is an ordinary verb and "XAI" a standard ML abbreviation;
+    # scrubbing them would corrupt legitimate review prose.
+    text = "It takes a while to grok the new XAI pipeline in this module."
+    assert scrub_identity(text) == text
 
 
 def test_existing_terms_still_scrubbed():

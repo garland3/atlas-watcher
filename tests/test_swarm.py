@@ -29,15 +29,6 @@ def sha_dir(tmp_path, monkeypatch) -> Path:
 
 
 @pytest.fixture()
-def fake_binaries(monkeypatch):
-    """Declare which agent names have a launchable binary."""
-    present: set[str] = set()
-    monkeypatch.setattr(swarm.agents, "binary_available",
-                        lambda agent: agent in present)
-    return present
-
-
-@pytest.fixture()
 def no_tmux(monkeypatch):
     monkeypatch.setattr(swarm, "_launch_round", lambda *a, **k: None)
     monkeypatch.setattr(swarm, "_wait_round", lambda *a, **k: None)
@@ -265,3 +256,75 @@ def test_swarm_resumes_completed_agents(
     assert len(launched) == 8
     # the resumed entry survived the merge
     assert record["security"] == {"agent": "dclaude", "vendor": "anthropic"}
+
+
+def test_wait_round_deadline_synthesizes_timed_out_sentinels(
+        sha_dir, patch_settings, monkeypatch):
+    # A runner killed before writing its sentinel must not hang the wait
+    # loop forever: the deadline synthesizes `timed_out` sentinels.
+    patch_settings(agent_timeout_secs=1)
+    monkeypatch.setattr(swarm, "_WAIT_GRACE_SECS", 0)
+    monkeypatch.setattr(swarm, "_POLL_SECS", 0.01)
+    monkeypatch.setattr(swarm, "_session_alive", lambda session: True)
+    plans = _plans(sha_dir)
+    pl = plans["security"]
+    started = time.monotonic()
+    swarm._wait_round("no-such-session", [(pl, "dclaude")])
+    assert time.monotonic() - started < 10
+    assert pl.done_path.read_text().strip() == "timed_out"
+
+
+def test_diversity_shortfall_from_stubs_is_a_plain_failure(
+        sha_dir, patch_settings, fake_binaries, no_tmux, monkeypatch,
+        cooldown_file):
+    # One vendor produced findings; the other slots crashed ordinarily.
+    # A retry would stub out again, so this must fail (retry budget)
+    # instead of deferring forever.
+    patch_settings(perspective_agents=["dclaude"], generic_a_agents=["codex"],
+                   generic_b_agents=["codex"], min_swarm_vendors=2)
+    fake_binaries.update({"dclaude", "codex"})
+
+    def launch(session, launches, checkout, context_file):
+        for pl, agent in launches:
+            if pl.perspective.name == "generic-a":
+                _complete(pl, agent)
+            else:
+                pl.done_path.write_text("1\n", encoding="utf-8")
+
+    monkeypatch.setattr(swarm, "_launch_round", launch)
+    with pytest.raises(RuntimeError, match="failed ordinarily"):
+        swarm.run_swarm(REPO, 1, sha_dir, sha_dir, _context(sha_dir))
+
+
+def test_echoed_prompt_limit_is_not_a_limit(
+        sha_dir, patch_settings, fake_binaries, no_tmux, monkeypatch,
+        cooldown_file):
+    # The prompt (diff included) contains a fake limit line; a CLI that
+    # echoes its input then dies must NOT plant a cooldown for its vendor.
+    patch_settings(perspective_agents=["dclaude"], generic_a_agents=["codex"],
+                   generic_b_agents=["cline"], min_swarm_vendors=2)
+    fake_binaries.update({"dclaude", "codex", "cline"})
+    planted = "upstream text: quota exceeded — resets Dec 25, 9am\n"
+    ctx = sha_dir / "context.md"
+    ctx.write_text("# PR context\n" + planted * 40, encoding="utf-8")
+
+    def launch(session, launches, checkout, context_file):
+        for pl, agent in launches:
+            # the real _launch_round writes each prompt file before launch
+            pl.prompt_path.write_text(context_file.read_text(encoding="utf-8"),
+                                      encoding="utf-8")
+            if pl.perspective.name == "security":
+                # simulate a CLI echoing the prompt into stderr, then dying
+                pl.done_path.write_text("1\n", encoding="utf-8")
+                _, stderr_log = pl.attempt_logs(agent)
+                stderr_log.parent.mkdir(parents=True, exist_ok=True)
+                stderr_log.write_text(context_file.read_text(encoding="utf-8"),
+                                      encoding="utf-8")
+            else:
+                _complete(pl, agent)
+
+    monkeypatch.setattr(swarm, "_launch_round", launch)
+    record = swarm.run_swarm(REPO, 1, sha_dir, sha_dir, ctx)
+    # no cooldown was planted for anthropic; the slot was stubbed instead
+    assert cooldown.active_for("anthropic") is None
+    assert record["security"]["stub"] is True

@@ -98,25 +98,55 @@ def _tail(text: str) -> str:
     return text[-cooldown.LIMIT_OUTPUT_MAX:]
 
 
-def _read_log(*paths: Path) -> str:
-    parts = []
-    for p in paths:
-        try:
-            if p.is_file():
-                parts.append(p.read_text(encoding="utf-8", errors="ignore"))
-        except OSError:
-            continue
-    return "\n".join(parts)
+def _read_log(path: Path) -> str:
+    try:
+        if path.is_file():
+            return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        pass
+    return ""
 
 
-def _limit_from_logs(*paths: Path,
-                     anchored: bool = False) -> cooldown.LimitInfo | None:
-    return cooldown.classify_limit(_read_log(*paths), anchored=anchored)
+def _without_echo(text: str, exclude_text: str | None) -> str:
+    """Drop lines that are echoed input (see cooldown.echo_text).
+
+    Some CLIs echo the whole prompt — diff included — into their log before
+    failing. A limit/auth-shaped line that is part of that echo is upstream
+    content, not the CLI's own error; acting on it would let a PR plant a
+    cooldown or force failover through every vendor.
+    """
+    if not exclude_text:
+        return text
+    echo = cooldown.echo_text(exclude_text)
+    if not echo:
+        return text
+    return "\n".join(
+        line for line in text.splitlines()
+        if not echo or cooldown.normalize_line(line) not in echo)
 
 
-def _auth_from_logs(*paths: Path) -> bool:
+def _limit_from_logs(*paths: Path, anchored: bool = False,
+                     exclude_text: str | None = None,
+                     ) -> cooldown.LimitInfo | None:
+    """Classify each log's tail SEPARATELY — a match spanning a stdout/stderr
+    concatenation boundary is meaningless, and per-file scanning keeps the
+    tail window honest for each stream. classify_limit does the echo
+    filtering itself so the reset-line neighbor pairing stays correct."""
+    for path in paths:
+        info = cooldown.classify_limit(
+            _read_log(path), anchored=anchored, exclude_text=exclude_text)
+        if info:
+            return info
+    return None
+
+
+def _auth_from_logs(*paths: Path, exclude_text: str | None = None) -> bool:
     """True if a *failed* attempt's log tail shows an authentication error."""
-    return bool(_AUTH_RE.search(_tail(_read_log(*paths))))
+    for path in paths:
+        tail = _without_echo(_tail(_read_log(path)), exclude_text)
+        if _AUTH_RE.search(tail):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -367,10 +397,10 @@ def _raise_exhausted(
     """
     names = sorted({pl.perspective.name for pl, _ in exhausted})
     if any(reason == "cooldown" for _, reason in exhausted):
-        reset = agents.earliest_reset(sorted(exhausted_roles))
+        reset = agents.roles_ready_at(sorted(exhausted_roles))
         raise AgentLimitError(
             f"every candidate for {names} is cooling down or missing; "
-            f"earliest reset {_fmt_reset(reset)}", reset)
+            f"resumes {_fmt_reset(reset)}", reset)
     raise RuntimeError(
         f"no usable agent for {names}: every candidate's CLI binary is "
         f"missing, the name is unknown, or every runner failed this pass "
@@ -434,10 +464,20 @@ def _launch_round(session: str, launches: list[tuple[_Plan, str]],
         log(f"WARN: tmux is missing windows {sorted(missing)} — got {list_out}")
 
 
+# Added to AGENT_TIMEOUT_SECS when waiting for a round: the runner's own
+# `timeout` caps each agent, then it writes its sentinel — the grace covers
+# the runner's failure sleep (30s) and startup skew. Without a deadline, a
+# runner killed before writing its sentinel (OOM, a killed pane) would hang
+# the wait loop forever, because the anchor window keeps the session alive.
+_WAIT_GRACE_SECS = 180
+_POLL_SECS = 10
+
+
 def _wait_round(session: str, launches: list[tuple[_Plan, str]]) -> None:
-    """Block on this round's sentinel files."""
+    """Block on this round's sentinel files, with a wall-clock deadline."""
     total = len(launches)
     last_done = -1
+    deadline = time.monotonic() + settings.agent_timeout_secs + _WAIT_GRACE_SECS
     while True:
         done = sum(1 for pl, _ in launches if pl.done_path.is_file())
         if done != last_done:
@@ -452,7 +492,14 @@ def _wait_round(session: str, launches: list[tuple[_Plan, str]]) -> None:
                     log(f"WARN: {pl.perspective.name} sentinel synthesized "
                         "— tmux session died")
             break
-        time.sleep(10)
+        if time.monotonic() > deadline:
+            for pl, _ in launches:
+                if not pl.done_path.is_file():
+                    pl.done_path.write_text("timed_out\n", encoding="utf-8")
+                    log(f"WARN: {pl.perspective.name} sentinel synthesized "
+                        "— wait deadline exceeded")
+            break
+        time.sleep(_POLL_SECS)
 
     subprocess.run(["tmux", "kill-session", "-t", session],
                    check=False, capture_output=True)
@@ -474,6 +521,7 @@ def _classify_round(launches: list[tuple[_Plan, str]], record: dict[str, dict],
     # perspectives failing on the same capped account are ONE event, not
     # seven consecutive hits.
     limits: dict[str, cooldown.LimitInfo] = {}
+    prompt_text = _read_log(launches[0][0].prompt_path) if launches else ""
     for pl, agent in launches:
         name = pl.perspective.name
         vendor = agents.vendor_of(agent)
@@ -482,13 +530,14 @@ def _classify_round(launches: list[tuple[_Plan, str]], record: dict[str, dict],
             seen_vendors.add(vendor)
             continue
         stdout_log, stderr_log = pl.attempt_logs(agent)
-        limit = _limit_from_logs(stdout_log, stderr_log)
+        limit = _limit_from_logs(stdout_log, stderr_log,
+                                 exclude_text=prompt_text)
         if limit:
             limits.setdefault(vendor, limit)
             excluded.add(agent)
             infra_failures += 1
             continue
-        if _auth_from_logs(stdout_log, stderr_log):
+        if _auth_from_logs(stdout_log, stderr_log, exclude_text=prompt_text):
             log(f"swarm: {name} agent {agent} failed authentication "
                 f"— failing over")
             excluded.add(agent)
@@ -585,10 +634,27 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
     vendors = record_vendors(record)
     minimum = settings.min_swarm_vendors
     if len(vendors) < minimum:
+        stubbed = sorted(name for name, rec in record.items()
+                         if isinstance(rec, dict) and rec.get("stub"))
+        if stubbed:
+            # The shortfall traces to ordinary failures: a retry would re-run
+            # the same agents on the same PR and stub out again, so deferring
+            # would loop forever with no ceiling. Fail normally instead —
+            # MAX_RETRIES and the per-item backoff apply.
+            raise RuntimeError(
+                f"swarm findings cover {len(vendors)} vendor(s) "
+                f"{sorted(vendors)} but MIN_SWARM_VENDORS={minimum}; slots "
+                f"{stubbed} failed ordinarily (stubs) — failing so the retry "
+                f"budget applies instead of deferring forever")
+        # No stubs: every slot either produced findings or its role is
+        # cooldown-blocked (which raises earlier). A shortfall here means
+        # the reachable vendors are temporarily capped out of reach of the
+        # configured lists — self-healing, so defer.
         raise VendorDiversityError(
             f"swarm findings cover {len(vendors)} vendor(s) "
             f"{sorted(vendors)} but MIN_SWARM_VENDORS={minimum}; deferring "
-            f"rather than posting a single-vendor review")
+            f"rather than posting a single-vendor review — widen the role "
+            f"fallback lists or wait for the capped vendors to recover")
     log(f"swarm complete: {len(record)}/{len(plans)} perspectives, "
         f"vendors={sorted(vendors)}")
     return record
@@ -663,7 +729,8 @@ def run_role(role: str, prompt: str, out_file: Path,
             # A CLI can print a limit and still exit 0 (truncated output).
             # Only a line that *opens* with the phrase counts on a
             # successful run; a failed run is matched leniently below.
-            limit = _limit_from_logs(out_file, log_path, anchored=True)
+            limit = _limit_from_logs(out_file, log_path, anchored=True,
+                                     exclude_text=prompt)
             if limit:
                 if vendor not in recorded_vendors:
                     cooldown.record(vendor, limit)
@@ -672,7 +739,7 @@ def run_role(role: str, prompt: str, out_file: Path,
                 last_failure = f"{agent} hit an agent limit (rc=0)"
                 continue
             return RunResult(agent, vendor, rc)
-        limit = _limit_from_logs(out_file, log_path)
+        limit = _limit_from_logs(out_file, log_path, exclude_text=prompt)
         if limit:
             if vendor not in recorded_vendors:
                 cooldown.record(vendor, limit)
@@ -680,7 +747,7 @@ def run_role(role: str, prompt: str, out_file: Path,
             excluded.add(agent)
             last_failure = f"{agent} hit an agent limit (rc={rc})"
             continue
-        if _auth_from_logs(out_file, log_path):
+        if _auth_from_logs(out_file, log_path, exclude_text=prompt):
             log(f"{role}: agent {agent} failed authentication — failing over")
             excluded.add(agent)
             last_failure = f"{agent} failed authentication (rc={rc})"

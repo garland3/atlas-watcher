@@ -165,32 +165,37 @@ def pick(
     return available[0], None
 
 
-def block_reason(roles: tuple[str, ...] | list[str]) -> str | None:
-    """``None`` if every role has a usable candidate; else why roles are blocked.
+def refresh_binaries() -> None:
+    """Forget cached preflight results.
 
-    ``"cooldown"`` when at least one blocked role can heal itself as its
-    cooldowns expire (cooldowns dominate a mixed block: the missing binaries
-    will still be missing later, and the run will fail loudly then).
-    ``"missing"`` only when no blocked role has a cooldown path back — a
-    configuration error that no amount of waiting fixes.
+    ``binary_available`` caches per process; a CLI installed while a
+    long-running ``loop`` is live would otherwise stay "missing" until
+    restart. Call once per scan pass.
     """
-    reasons: list[str] = []
-    for role in roles:
-        _, reason = pick(role_candidates(role))
-        if reason is not None:
-            reasons.append(reason)
-    if not reasons:
-        return None
-    return "cooldown" if "cooldown" in reasons else "missing"
+    binary_available.cache_clear()
 
 
-def earliest_reset(roles: tuple[str, ...] | list[str]) -> float | None:
-    """Earliest cooldown reset among the vendors backing ``roles``.
+def roles_ready_at(roles: tuple[str, ...] | list[str]) -> float | None:
+    """When ALL of these roles can run again, or None if nothing blocks them.
 
-    The moment the first blocked role could run again — when a paused pass
-    should be retried.
+    A role becomes runnable at the earliest reset among ITS cooling
+    candidates; the whole set is ready at the LATEST of those per-role
+    moments (reporting the global minimum would promise a resume time
+    earlier than the item can actually run). Roles with no cooling
+    candidate are ready now and don't push the time out; roles blocked
+    without any cooldown (missing binaries) never heal and are ignored
+    here — callers surface those as failures, not as a wait.
     """
-    vendors: set[str] = set()
+    ready: float | None = None
     for role in roles:
-        vendors.update(vendor_of(a) for a in role_candidates(role))
-    return cooldown.earliest_reset(vendors)
+        resets = [
+            state["until_ts"]
+            for agent in role_candidates(role)
+            if binary_available(agent)
+            and (state := cooldown.active_for(vendor_of(agent)))
+        ]
+        if not resets:
+            continue
+        role_ready = min(resets)
+        ready = role_ready if ready is None else max(ready, role_ready)
+    return ready

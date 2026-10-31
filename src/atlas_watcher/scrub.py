@@ -15,9 +15,20 @@ _FORBIDDEN_WORDS = (
     r"cline",
     r"opencode",
     r"openrouter",
-    r"grok",
-    r"xai",
+)
+
+# The xAI/Grok tokens are narrower than the list above, on purpose: "grok"
+# is an ordinary English verb and "XAI" is a standard abbreviation for
+# explainable AI, so a bare word match would silently corrupt reviews that
+# legitimately use those words. Only identity-shaped forms are scrubbed —
+# model ids ("grok-4.7"), the domain ("x.ai") and the org id ("x-ai").
+# prompts/identity.md still forbids the bare words at the source; this
+# scrubber is the last-line net, and a missed bare mention costs less than
+# a mangled review.
+_XAI_WORDS = (
+    r"grok[-_.\s]?\d",   # grok-4, grok 4.7, grok4
     r"x\.ai",
+    r"\bx-ai\b",
 )
 # Trailing "s?" catches plurals/org forms ("anthropics", "codexes" → "codex"
 # already matches); \b handles possessives ("claude's") on its own.
@@ -71,12 +82,15 @@ def scrub_identity(text: str) -> str:
     Dot-directory paths quoted from the reviewed codebase are left intact —
     see :func:`_is_dot_directory`.
     """
-    def _replace(m: re.Match[str]) -> str:
-        if _is_dot_directory(text, m.start(), m.end()):
-            return m.group(0)
-        return "the reviewer"
+    def sub(source: str, pattern: re.Pattern) -> str:
+        def _replace(m: re.Match[str]) -> str:
+            if _is_dot_directory(source, m.start(), m.end()):
+                return m.group(0)
+            return "the reviewer"
+        return pattern.sub(_replace, source)
 
-    out = _WORD_RE.sub(_replace, text)
+    out = sub(text, _WORD_RE)
+    out = sub(out, re.compile("|".join(_XAI_WORDS), re.IGNORECASE))
     for pattern, replacement in _PHRASE_RES:
         out = pattern.sub(replacement, out)
     return out

@@ -109,19 +109,51 @@ _RESET_IN_RE = re.compile(
 class LimitInfo:
     reason: str
     reset_ts: float | None
+    # True when the match came from the explicit limit wordings (the CLIs'
+    # real messages) rather than the weak cap-word+retry-hint fallback. A
+    # *stated* reset is honored out to agent_limit_reset_max_secs (8 days,
+    # a weekly limit) only for strong matches; a weak match's reset is
+    # capped at the ordinary backoff ceiling, because a guess must not be
+    # able to park a vendor for days.
+    strong: bool = True
 
 
-def _line_matches(line: str, anchored: bool) -> bool:
+def normalize_line(line: str) -> str:
+    """Whitespace-normalized form of a log line, for echo comparison."""
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def echo_text(exclude_text: str | None) -> str:
+    """Whitespace-normalized form of the text we ourselves sent to the agent.
+
+    Some CLIs echo their input (the whole prompt, diff included) into the
+    log before failing. A limit-shaped line that appears inside that echo
+    is upstream content, not the CLI's own error — acting on it would let a
+    PR plant a cooldown (or force failover) for a vendor. A matched log line
+    that appears as a (normalized) substring of the echo is ignored; a CLI's
+    own message gets a prefix ("ERROR: …") and does not appear verbatim in
+    the prompt, so real limits still match.
+    """
+    if not exclude_text:
+        return ""
+    return re.sub(r"\s+", " ", exclude_text).strip()
+
+
+def _line_match(line: str, anchored: bool) -> tuple[bool, bool]:
+    """(matched, strong) for one log line."""
     for p in _LIMIT_PATTERNS:
         m = re.search(p, line, re.IGNORECASE)
         if m and (not anchored or m.start() <= _ANCHOR_SLACK):
-            return True
+            return True, True
     if anchored:
-        return False
-    return bool(_FALLBACK_CAP_RE.search(line) and _FALLBACK_RETRY_RE.search(line))
+        return False, False
+    if _FALLBACK_CAP_RE.search(line) and _FALLBACK_RETRY_RE.search(line):
+        return True, False
+    return False, False
 
 
-def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
+def classify_limit(text: str, anchored: bool = False, *,
+                   exclude_text: str | None = None) -> LimitInfo | None:
     """Return details if ``text`` looks like an agent rate/session limit.
 
     ``anchored`` requires the phrase to open its line (give or take a short
@@ -142,6 +174,11 @@ def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
       successful run's output is review content; the anchored rule alone is
       not enough reason to regex thousands of characters of it.
 
+    ``exclude_text`` (the prompt we sent, when the caller has it) marks lines
+    that are echoed input: matches verbatim inside it are skipped, and the
+    reset time is parsed only from surviving match lines — so upstream text
+    cannot plant a multi-day cooldown by quoting one in a diff.
+
     Pure: never writes state. Callers decide whether to record a cooldown.
     """
     if not text:
@@ -150,11 +187,28 @@ def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
         if anchored:
             return None
         text = text[-LIMIT_OUTPUT_MAX:]
-    for line in text.splitlines():
-        if _line_matches(line, anchored):
-            return LimitInfo(reason=line.strip()[:200],
-                             reset_ts=_parse_reset(text))
-    return None
+    echo = echo_text(exclude_text)
+    lines = text.splitlines()
+    matched: list[str] = []
+    strong = False
+    for i, line in enumerate(lines):
+        hit, is_strong = _line_match(line, anchored)
+        if not hit:
+            continue
+        if echo and normalize_line(line) in echo:
+            continue
+        if not matched:
+            # The CLI often states the reset on the line after the limit
+            # ("usage limit reached.\nResets 3pm (America/Denver)") — parse
+            # from the matched line plus that one neighbor, never the whole
+            # tail (the tail may otherwise be echoed prompt/diff text).
+            matched = [line, lines[i + 1] if i + 1 < len(lines) else ""]
+        strong = strong or is_strong
+    if not matched:
+        return None
+    return LimitInfo(reason=matched[0].strip()[:200],
+                     reset_ts=_parse_reset("\n".join(matched)),
+                     strong=strong)
 
 
 def _parse_reset(text: str, now: datetime | None = None) -> float | None:
@@ -278,9 +332,12 @@ def record(vendor: str, limit: LimitInfo) -> dict:
     Honors the agent's stated reset time when it parses, otherwise backs off
     exponentially by consecutive limit hits (base * 2^(n-1)), capped both
     ways. The fallback cap matters because a guess must not park the vendor
-    for a day: retrying early only re-detects the limit and extends. A stated
-    reset gets the longer ``agent_limit_reset_max_secs`` ceiling, since a
-    weekly limit really does last days.
+    for a day: retrying early only re-detects the limit and extends. A
+    stated reset from a *strong* match (a known CLI limit wording) gets the
+    longer ``agent_limit_reset_max_secs`` ceiling, since a weekly limit
+    really does last days; a weak (fallback-heuristic) match's stated reset
+    is capped at the ordinary backoff ceiling — an unverified claim must
+    not be able to park a vendor for days.
 
     Only ``vendor`` is paused. Roles running on other vendors keep running.
     """
@@ -295,7 +352,9 @@ def record(vendor: str, limit: LimitInfo) -> dict:
         settings.agent_limit_backoff_max_secs,
     )
     if limit.reset_ts and limit.reset_ts > now:
-        until = min(limit.reset_ts, now + settings.agent_limit_reset_max_secs)
+        ceiling = (settings.agent_limit_reset_max_secs if limit.strong
+                   else settings.agent_limit_backoff_max_secs)
+        until = min(limit.reset_ts, now + ceiling)
     else:
         until = min(now + fallback, now + settings.agent_limit_backoff_max_secs)
     state = {

@@ -147,6 +147,13 @@ are still scrubbed, because there the term *is* the identity leak. When
 changing `scrub.py`, test both directions: paths that must survive and
 leaks that must not.
 
+One asymmetry to keep in mind: `grok` is an ordinary English verb and
+`XAI` a standard ML abbreviation, so the *scrubber* only neutralizes
+identity-shaped forms (`grok-4.7`, `x.ai`, `x-ai`) while
+`prompts/identity.md` forbids the bare words at the source. A missed bare
+mention costs less than a mangled review. Keep that split when adding the
+next vendor whose name doubles as an English word.
+
 ---
 
 ## Repo layout

@@ -29,6 +29,19 @@ def cooldown_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
+def fake_binaries(monkeypatch):
+    """Declare which agent names have a launchable binary. Replaces the
+    real (cached) ``agents.binary_available`` probe entirely, so a test
+    never shells out and never sees the developer's installed CLIs."""
+    from atlas_watcher import agents
+
+    present: set[str] = set()
+    monkeypatch.setattr(agents, "binary_available",
+                        lambda agent: agent in present)
+    return present
+
+
+@pytest.fixture()
 def patch_settings(monkeypatch):
     """Patch attributes onto the settings singleton for one test.
 

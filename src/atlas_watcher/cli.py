@@ -87,18 +87,28 @@ def _scan_repo(repo: str, dry_run: bool) -> None:
 
 
 def _blocked_pass() -> bool:
-    """True when no role can run at all — the only thing that stops a pass.
+    """True only when NO role can run — the only thing that stops a pass.
 
-    Per-vendor cooldowns pause individual roles, not the whole watcher; the
-    pass only stops when every role's candidate list is cooling down.
+    Per-vendor cooldowns pause individual roles, not the whole watcher: a
+    pass stops only when every role's candidate list is cooling down. If
+    some other role is still runnable (issues need different roles than
+    PRs), the pass continues and per-item skipping handles the rest. Roles
+    blocked by missing binaries do not stop the pass either — those items
+    fail loudly through the normal path instead.
     """
-    if agents.block_reason(agents.ALL_ROLES) != "cooldown":
-        return False
-    reset = agents.earliest_reset(agents.ALL_ROLES)
-    until = (datetime.fromtimestamp(reset, tz=UTC).astimezone()
-             .isoformat(timespec="seconds") if reset else "unknown")
-    log(f"every role's agents are cooling down — stopping this pass "
-        f"(earliest reset {until})")
+    reasons = []
+    for role in agents.ALL_ROLES:
+        _, reason = agents.pick(agents.role_candidates(role))
+        reasons.append(reason)
+    if any(reason is None for reason in reasons):
+        return False  # at least one role can run — keep going
+    if "cooldown" not in reasons:
+        return False  # all blocked by config errors — let items fail loudly
+    ready = agents.roles_ready_at(agents.ALL_ROLES)
+    until = (datetime.fromtimestamp(ready, tz=UTC).astimezone()
+             .isoformat(timespec="seconds") if ready else "unknown")
+    log(f"no role can run: every role's agents are cooling down — "
+        f"stopping this pass (resumes {until})")
     return True
 
 
@@ -110,18 +120,22 @@ def _skip_item(repo: str, label: str, roles: tuple[str, ...]) -> bool:
     missing binaries are NOT skipped here — the run raises a real error so
     the misconfiguration surfaces in the ledger and logs.
     """
-    reason = agents.block_reason(roles)
-    if reason != "cooldown":
+    reasons = []
+    for role in roles:
+        _, reason = agents.pick(agents.role_candidates(role))
+        reasons.append(reason)
+    if not any(reason == "cooldown" for reason in reasons):
         return False
-    reset = agents.earliest_reset(roles)
-    until = (datetime.fromtimestamp(reset, tz=UTC).astimezone()
-             .isoformat(timespec="seconds") if reset else "unknown")
+    ready = agents.roles_ready_at(roles)
+    until = (datetime.fromtimestamp(ready, tz=UTC).astimezone()
+             .isoformat(timespec="seconds") if ready else "unknown")
     log(f"{repo} {label}: some roles' agents are cooling down — skipping "
         f"until {until}")
     return True
 
 
 def _one_pass(dry_run: bool) -> None:
+    agents.refresh_binaries()
     if _blocked_pass():
         return
     log(f"scan start: {len(settings.repos)} repo(s) — {settings.repos}")
