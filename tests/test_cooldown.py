@@ -8,6 +8,13 @@ from atlas_watcher import cooldown
 from atlas_watcher.cooldown import LimitInfo
 
 
+def _future_reset_str(days: int = 7) -> str:
+    """A reset time string relative to now, so the test never rots:
+    a hardcoded "Nov 30, 5pm" becomes a past date once November passes."""
+    from datetime import datetime, timedelta
+    return (datetime.now() + timedelta(days=days)).strftime("%b %d, %I%p")
+
+
 def test_record_pauses_only_the_hit_vendor(cooldown_file):
     cooldown.record("anthropic", LimitInfo("usage limit reached", None))
     cooldown.record("openai", LimitInfo("quota exceeded", None))
@@ -82,12 +89,13 @@ def test_weak_match_reset_is_capped_at_the_backoff_ceiling(
     # A fallback-heuristic (weak) match claiming a far-future reset must not
     # park the vendor for days.
     weak = cooldown.classify_limit(
-        "you've burned your credits — try again at Nov 30, 5pm")
+        f"you've burned your credits — try again at {_future_reset_str()}")
     assert weak is not None and weak.strong is False
     state = cooldown.record("anthropic", weak)
     assert state["until_ts"] < t.time() + 21600 + 5
 
-    strong = cooldown.classify_limit("usage limit reached. resets Nov 30, 5pm")
+    strong = cooldown.classify_limit(
+        f"usage limit reached. resets {_future_reset_str()}")
     assert strong is not None and strong.strong is True
     state = cooldown.record("openai", strong)
     assert state["until_ts"] > t.time() + 21600
@@ -108,7 +116,7 @@ def test_echoed_prompt_lines_do_not_plant_a_cooldown():
     # An upstream PR whose diff contains a fake limit message: the CLI
     # echoes the prompt (diff included) and dies. The echo must not be
     # mistaken for the CLI's own error.
-    planted = "+Our retry budget was exhausted (quota exceeded) — resets Nov 30\n"
+    planted = f"+Our retry budget was exhausted (quota exceeded) — resets {_future_reset_str()}\n"
     prompt = "# PR context\n" + planted * 50
     log = prompt + "ERROR: exit code 1\n"
     assert cooldown.classify_limit(log, anchored=False,

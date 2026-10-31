@@ -233,6 +233,33 @@ class Settings(BaseSettings):
                 )
         if self.min_swarm_vendors < 1:
             raise ValueError("MIN_SWARM_VENDORS must be >= 1")
+        # The swarm can only ever cover the vendors named by its role lists:
+        # no run can reach MIN_SWARM_VENDORS distinct vendors if the union of
+        # those lists' vendors is smaller. Reject that at load time rather
+        # than deferring every item with a misleading "wait for capped
+        # vendors" message — the lists are static, so waiting cannot fix
+        # them. (Binary availability is checked later, per pass: a missing
+        # CLI is a failover/live problem, not a config problem.)
+        swarm_vendors: set[str] = set()
+        for agent in (*self.perspective_agents, *self.generic_a_agents,
+                      *self.generic_b_agents):
+            spec = self.agent_commands.get(agent)
+            if spec and spec.vendor:
+                swarm_vendors.add(spec.vendor)
+            elif agent in AGENT_VENDORS:
+                swarm_vendors.add(AGENT_VENDORS[agent])
+            else:
+                # An agent registered in AGENT_COMMANDS without a vendor
+                # statement is its own account (see agents.vendor_of).
+                swarm_vendors.add(agent)
+        if len(swarm_vendors) < self.min_swarm_vendors:
+            raise ValueError(
+                f"swarm role lists cover {len(swarm_vendors)} vendor(s) "
+                f"{sorted(swarm_vendors)} but MIN_SWARM_VENDORS="
+                f"{self.min_swarm_vendors}; add candidates on more vendors "
+                f"to PERSPECTIVE_AGENTS/GENERIC_A_AGENTS/GENERIC_B_AGENTS or "
+                f"lower MIN_SWARM_VENDORS"
+            )
         return self
 
     @property

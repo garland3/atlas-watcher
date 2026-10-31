@@ -120,6 +120,7 @@ def pick(
     *,
     exclude_agents: frozenset[str] | set[str] = frozenset(),
     seen_vendors: frozenset[str] | set[str] = frozenset(),
+    require_unseen_vendor: bool = False,
 ) -> tuple[str | None, str | None]:
     """Choose which candidate should run a role right now.
 
@@ -141,10 +142,19 @@ def pick(
     vendor the swarm already has, so failover grows diversity toward
     MIN_SWARM_VENDORS. The initial pick never reorders: the operator's list
     order is the preference.
+
+    ``require_unseen_vendor`` only considers candidates on vendors NOT in
+    ``seen_vendors``: it is how a diversity re-run forces a completed slot
+    onto a vendor the record does not cover yet — a re-run on the slot's
+    current vendor would reproduce the same record and never grow
+    diversity. Here ``seen_vendors`` is an eligibility filter, not just a
+    preference.
     """
     available: list[str] = []
     cooling = False
     for agent in candidates:
+        if require_unseen_vendor and vendor_of(agent) in seen_vendors:
+            continue
         if not binary_available(agent):
             continue
         is_cooling = cooldown.active_for(vendor_of(agent)) is not None
@@ -158,7 +168,7 @@ def pick(
         available.append(agent)
     if not available:
         return None, ("cooldown" if cooling else "missing")
-    if exclude_agents and seen_vendors:
+    if exclude_agents and seen_vendors and not require_unseen_vendor:
         for agent in available:
             if vendor_of(agent) not in seen_vendors:
                 return agent, None

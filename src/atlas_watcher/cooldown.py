@@ -123,20 +123,23 @@ def normalize_line(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip()
 
 
-def echo_text(exclude_text: str | None) -> str:
-    """Whitespace-normalized form of the text we ourselves sent to the agent.
+def echo_lines(exclude_text: str | None) -> frozenset[str]:
+    """Whitespace-normalized lines of the text we ourselves sent to the agent.
 
     Some CLIs echo their input (the whole prompt, diff included) into the
     log before failing. A limit-shaped line that appears inside that echo
     is upstream content, not the CLI's own error — acting on it would let a
-    PR plant a cooldown (or force failover) for a vendor. A matched log line
-    that appears as a (normalized) substring of the echo is ignored; a CLI's
-    own message gets a prefix ("ERROR: …") and does not appear verbatim in
-    the prompt, so real limits still match.
+    PR plant a cooldown (or force failover) for a vendor. The match is
+    WHOLE-LINE: a log line is ignored only when its normalized form exactly
+    equals one of the prompt's lines. A CLI's own message gets a prefix
+    ("ERROR: …") and never equals a prompt line, so real limits still match;
+    and this repo's own docs (which legitimately contain the phrase on their
+    own line) suppress only the exact echoed copy, not the CLI's error.
     """
     if not exclude_text:
-        return ""
-    return re.sub(r"\s+", " ", exclude_text).strip()
+        return frozenset()
+    return frozenset(normalize_line(line)
+                     for line in exclude_text.splitlines())
 
 
 def _line_match(line: str, anchored: bool) -> tuple[bool, bool]:
@@ -175,9 +178,10 @@ def classify_limit(text: str, anchored: bool = False, *,
       not enough reason to regex thousands of characters of it.
 
     ``exclude_text`` (the prompt we sent, when the caller has it) marks lines
-    that are echoed input: matches verbatim inside it are skipped, and the
-    reset time is parsed only from surviving match lines — so upstream text
-    cannot plant a multi-day cooldown by quoting one in a diff.
+    that are echoed input: a log line whose normalized form exactly equals a
+    prompt line is skipped, and the reset time is parsed only from surviving
+    match lines — so upstream text cannot plant a multi-day cooldown by
+    quoting one in a diff.
 
     Pure: never writes state. Callers decide whether to record a cooldown.
     """
@@ -186,8 +190,18 @@ def classify_limit(text: str, anchored: bool = False, *,
     if len(text) > LIMIT_OUTPUT_MAX:
         if anchored:
             return None
-        text = text[-LIMIT_OUTPUT_MAX:]
-    echo = echo_text(exclude_text)
+        cut = len(text) - LIMIT_OUTPUT_MAX
+        # A tail cut can land mid-line. The first line of the slice is then
+        # a partial line (e.g. "try budget was exhausted ...") whose
+        # normalized form equals no prompt line, so it would slip past the
+        # echo filter below and plant a cooldown from echoed prompt text.
+        # Drop it: the slice's only incomplete line is its first, and the
+        # CLI's own limit message sits at the end of the log.
+        mid_line_cut = text[cut - 1] != "\n"
+        text = text[cut:]
+        if mid_line_cut and "\n" in text:
+            text = text[text.index("\n") + 1:]
+    echo = echo_lines(exclude_text)
     lines = text.splitlines()
     matched: list[str] = []
     strong = False
@@ -377,13 +391,20 @@ def earliest_reset(vendors) -> float | None:
 
     A role blocked on cooldown resumes at the earliest reset among its
     candidates; a whole pass resumes when the earliest blocked role can run.
+
+    Liveness is checked on every key exactly as ``active_for`` does: an
+    expired per-vendor entry must not hide a still-live legacy ("*")
+    cooldown — the error would otherwise report "earliest reset unknown"
+    while a global cooldown is still pausing everything.
     """
     states = _load()
     resets = []
     for vendor in vendors:
-        state = states.get(vendor) or states.get(LEGACY_ALL)
-        if state and (live := _live(state)):
-            resets.append(float(live["until_ts"]))
+        for key in (vendor, LEGACY_ALL):
+            state = states.get(key)
+            if state and (live := _live(state)):
+                resets.append(float(live["until_ts"]))
+                break
     return min(resets) if resets else None
 
 

@@ -108,21 +108,24 @@ def _read_log(path: Path) -> str:
 
 
 def _without_echo(text: str, exclude_text: str | None) -> str:
-    """Drop lines that are echoed input (see cooldown.echo_text).
+    """Drop lines that are echoed input (see cooldown.echo_lines).
 
     Some CLIs echo the whole prompt — diff included — into their log before
     failing. A limit/auth-shaped line that is part of that echo is upstream
     content, not the CLI's own error; acting on it would let a PR plant a
-    cooldown or force failover through every vendor.
+    cooldown or force failover through every vendor. The match is
+    whole-line: a log line is dropped only when its normalized form exactly
+    equals one of the prompt's lines, so a CLI error that merely mentions a
+    phrase the prompt also contains still counts.
     """
     if not exclude_text:
         return text
-    echo = cooldown.echo_text(exclude_text)
+    echo = cooldown.echo_lines(exclude_text)
     if not echo:
         return text
     return "\n".join(
         line for line in text.splitlines()
-        if not echo or cooldown.normalize_line(line) not in echo)
+        if cooldown.normalize_line(line) not in echo)
 
 
 def _limit_from_logs(*paths: Path, anchored: bool = False,
@@ -521,7 +524,6 @@ def _classify_round(launches: list[tuple[_Plan, str]], record: dict[str, dict],
     # perspectives failing on the same capped account are ONE event, not
     # seven consecutive hits.
     limits: dict[str, cooldown.LimitInfo] = {}
-    prompt_text = _read_log(launches[0][0].prompt_path) if launches else ""
     for pl, agent in launches:
         name = pl.perspective.name
         vendor = agents.vendor_of(agent)
@@ -530,14 +532,20 @@ def _classify_round(launches: list[tuple[_Plan, str]], record: dict[str, dict],
             seen_vendors.add(vendor)
             continue
         stdout_log, stderr_log = pl.attempt_logs(agent)
+        # Each slot has its own prompt (a distinct perspective rules file plus
+        # the shared context), so the echo filter must be built from THAT
+        # slot's prompt: excluding with another slot's prompt could suppress
+        # a real CLI error (a phrase present in one prompt but not the
+        # other), or fail to suppress a line that only this slot echoes.
+        slot_prompt = _read_log(pl.prompt_path)
         limit = _limit_from_logs(stdout_log, stderr_log,
-                                 exclude_text=prompt_text)
+                                 exclude_text=slot_prompt)
         if limit:
             limits.setdefault(vendor, limit)
             excluded.add(agent)
             infra_failures += 1
             continue
-        if _auth_from_logs(stdout_log, stderr_log, exclude_text=prompt_text):
+        if _auth_from_logs(stdout_log, stderr_log, exclude_text=slot_prompt):
             log(f"swarm: {name} agent {agent} failed authentication "
                 f"— failing over")
             excluded.add(agent)
@@ -564,6 +572,49 @@ def _classify_round(launches: list[tuple[_Plan, str]], record: dict[str, dict],
     return infra_failures
 
 
+def _diversity_rerun_targets(plans, record, seen_vendors,
+                             excluded) -> list[tuple[_Plan, str]]:
+    """Slots worth re-running on an unseen vendor to grow diversity.
+
+    A completed swarm that falls short of MIN_SWARM_VENDORS can often still
+    improve: a slot that completed on vendor X (the only candidate its
+    operator-list order ever reached) may have a candidate on vendor Y that
+    is available right now. Re-running a bounded number of such slots on an
+    unseen vendor replaces their findings with a run on the new vendor, so
+    the gate can actually be met instead of deferring forever.
+
+    Each slot is re-run at most once per pass for this purpose; a slot that
+    fails again ordinarily ends up a stub, which the shortfall check below
+    turns into a plain (retry-budgeted) failure rather than a livelock.
+    """
+    minimum = settings.min_swarm_vendors
+    need = minimum - len(record_vendors(record))
+    if need <= 0:
+        return []
+    targets: list[tuple[_Plan, str]] = []
+    gained: set[str] = set()
+    for pl in plans:
+        rec = record.get(pl.perspective.name)
+        if not rec or rec.get("stub"):
+            continue  # stubs are handled by the ordinary-failure branch
+        agent, _reason = agents.pick(
+            agents.role_candidates(pl.perspective.role),
+            exclude_agents=excluded,
+            seen_vendors=seen_vendors,
+            require_unseen_vendor=True,
+        )
+        if agent is None:
+            continue
+        vendor = agents.vendor_of(agent)
+        if vendor in gained:
+            continue
+        gained.add(vendor)
+        targets.append((pl, agent))
+        if len(targets) >= need:
+            break
+    return targets
+
+
 def run_swarm(repo: str, pr_number: int, checkout: Path,
               out_dir: Path, context_file: Path) -> dict[str, dict]:
     """Launch all perspectives in parallel, failing over as needed.
@@ -583,6 +634,10 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
     seen_vendors = record_vendors(record)
     excluded: set[str] = set()
     resolved: set[str] = set()   # resolved THIS pass (stubs, kept partials)
+    # Slots being re-run on an unseen vendor to grow diversity: they pick
+    # with require_unseen_vendor so the re-run cannot just reproduce the
+    # vendor the record already has.
+    unseen_only: set[str] = set()
     round_no = 0
 
     while True:
@@ -590,6 +645,24 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
                    if pl.perspective.name not in resolved
                    and not _agent_completed(pl.done_path, pl.findings_path)]
         if not pending:
+            # Every slot is resolved for this pass. A shortfall on vendor
+            # diversity can still improve: re-run a bounded number of
+            # completed slots on unseen vendors before giving up. Slots that
+            # fail the re-run ordinarily become stubs, which the shortfall
+            # check below turns into a plain (retry-budgeted) failure.
+            targets = _diversity_rerun_targets(plans, record, seen_vendors,
+                                               excluded)
+            if targets:
+                for pl, agent in targets:
+                    log(f"swarm: re-running {pl.perspective.name} on "
+                        f"{agent} ({agents.vendor_of(agent)}) to reach "
+                        f"vendor diversity")
+                    pl.done_path.unlink(missing_ok=True)
+                    pl.findings_path.unlink(missing_ok=True)
+                    record.pop(pl.perspective.name, None)
+                    unseen_only.add(pl.perspective.name)
+                seen_vendors = record_vendors(record)
+                continue
             break
         round_no += 1
         launches: list[tuple[_Plan, str]] = []
@@ -600,6 +673,7 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
                 agents.role_candidates(pl.perspective.role),
                 exclude_agents=excluded,
                 seen_vendors=seen_vendors,
+                require_unseen_vendor=pl.perspective.name in unseen_only,
             )
             if agent is None:
                 exhausted.append((pl, reason))
@@ -623,6 +697,7 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
         failures = _classify_round(launches, record, seen_vendors, excluded,
                                    resolved)
         _save_record(out_dir, record)
+        unseen_only -= resolved
         if failures == 0:
             break
 
@@ -694,7 +769,8 @@ def _launch_single(agent: str, prompt: str, out_file: Path,
 
 def run_role(role: str, prompt: str, out_file: Path,
              log_file: Path | None = None,
-             cwd: Path | None = None) -> RunResult:
+             cwd: Path | None = None,
+             raise_on_failure: bool = True) -> RunResult:
     """Run one role synchronously, failing over across its candidate list.
 
     Used by the manager and the triage flows. The agent reads the prompt
@@ -702,7 +778,16 @@ def run_role(role: str, prompt: str, out_file: Path,
     attempt that decides the outcome). Fails over on infrastructure
     failures only — an agent rate/session limit, an authentication error,
     or a missing binary (preflighted before launch). An ordinary failure
-    raises: it is the item's problem, not the vendor's.
+    is the item's problem, not the vendor's:
+
+    - ``raise_on_failure=True`` (default) raises on it, so the caller
+      decides whether the item counts as failed.
+    - ``raise_on_failure=False`` returns the failed attempt's
+      :class:`RunResult` with its rc instead — used by triage and manager
+      roles, where an empty/failed run must fall back to a cautious
+      ``warn`` verdict (triage) or an explicit "no summary" check
+      (manager) rather than marking the whole item failed. Limit and
+      auth failures still fail over in this mode.
     """
     candidates = agents.role_candidates(role)
     excluded: set[str] = set()
@@ -712,8 +797,10 @@ def run_role(role: str, prompt: str, out_file: Path,
         agent, reason = agents.pick(candidates, exclude_agents=excluded)
         if agent is None:
             if reason == "cooldown":
-                reset = cooldown.earliest_reset(
-                    {agents.vendor_of(a) for a in candidates})
+                # roles_ready_at checks liveness on every cooldown entry
+                # (per-vendor and the legacy global), so an expired
+                # per-vendor entry can't hide a still-live global pause.
+                reset = agents.roles_ready_at((role,))
                 raise AgentLimitError(
                     f"{role}: every candidate is cooling down; "
                     f"earliest reset {_fmt_reset(reset)}", reset)
@@ -752,5 +839,12 @@ def run_role(role: str, prompt: str, out_file: Path,
             excluded.add(agent)
             last_failure = f"{agent} failed authentication (rc={rc})"
             continue
-        raise RuntimeError(
-            f"{role} agent {agent} failed with rc={rc}; see {log_path}")
+        if raise_on_failure:
+            raise RuntimeError(
+                f"{role} agent {agent} failed with rc={rc}; see {log_path}")
+        # Non-raising mode: the caller (triage/manager) handles an ordinary
+        # failure itself — a cautious warn or a "no summary" check — so the
+        # attempt's rc is surfaced instead of marking the item failed.
+        log(f"WARN: {role} agent {agent} failed with rc={rc} "
+            f"(non-raising mode); see {log_path}")
+        return RunResult(agent, vendor, rc)

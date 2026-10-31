@@ -16,7 +16,8 @@ CLEAN = json.dumps({"risk": "low", "score": 0,
 def triage_agent(monkeypatch):
     """Replace the triage agent with a stub that emits a fixed verdict."""
     def install(raw_output: str, agent: str = "dclaude"):
-        def fake_run_role(role, prompt, out_file, log_file=None, cwd=None):
+        def fake_run_role(role, prompt, out_file, log_file=None, cwd=None,
+                          **_kwargs):
             assert role == "security-triage"
             out_file.write_text(raw_output, encoding="utf-8")
             return RunResult(agent=agent, vendor=agent, rc=0)

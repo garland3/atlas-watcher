@@ -266,13 +266,18 @@ def _run_model_verdict(text: str, snap_dir: Path) -> dict[str, Any]:
         out_file=out_path,
         log_file=snap_dir / "security.log",
         cwd=None,
+        # A triage that dies ordinarily (timeout, crash) must not mark the
+        # whole item failed — assess() below leans toward warn for it, and
+        # the heuristic verdict still applies.
+        raise_on_failure=False,
     )
     raw = out_path.read_text(encoding="utf-8") if out_path.is_file() else ""
     verdict = _parse_model_output(raw)
     verdict["agent_rc"] = result.rc
     # Models score risk differently. Record which agent produced the
-    # verdict — and whether it was a fallback — so a weaker failover
-    # verdict is traceable (and handled more cautiously, see assess).
+    # verdict — and whether it was a fallback or an ordinary failure — so a
+    # weaker failover verdict (or a failed triage run) is traceable and
+    # handled more cautiously (see assess).
     verdict["agent"] = result.agent
     verdict["vendor"] = result.vendor
     verdict["agent_fallback"] = (
@@ -360,20 +365,26 @@ def assess(repo: str, kind: str, number: int, text: str,
     # leniently) than the primary — and a *clean-looking* verdict from an
     # unfamiliar model is exactly where under-scoring would hide. Lean
     # toward warning more, not less (rule 12c): when the verdict came from a
-    # fallback agent and ANY signal is nonzero (model score or a heuristic),
-    # do not proceed silently — a banner is cheap, a missed injection is
-    # not. Blocks are NOT manufactured here; the existing corroboration
-    # rules still govern those.
+    # fallback agent — or the triage run itself failed ordinarily (rc != 0,
+    # so the model output is untrusted) — and ANY signal is nonzero (model
+    # score or a heuristic), do not proceed silently: a banner is cheap, a
+    # missed injection is not. Blocks are NOT manufactured here; the
+    # existing corroboration rules still govern those.
     upgraded = False
-    if decision == "proceed" and model.get("agent_fallback"):
+    triage_failed = int(model.get("agent_rc") or 0) != 0
+    if decision == "proceed" and (model.get("agent_fallback")
+                                  or triage_failed):
         weak_signal = (int(model.get("score") or 0) > 0
                        or bool(heur.get("signals")))
         if weak_signal:
             decision = "warn"
             upgraded = True
+            why = (f"triage ran on fallback agent {model.get('agent')}"
+                   if model.get("agent_fallback") else
+                   f"triage agent {model.get('agent')} failed with rc="
+                   f"{model.get('agent_rc')}")
             log(f"security: {kind} #{number} proceed upgraded to warn — "
-                f"triage ran on fallback agent {model.get('agent')} "
-                f"(model score {model.get('score')}, "
+                f"{why} (model score {model.get('score')}, "
                 f"signals {heur.get('signals')})")
 
     verdict = {

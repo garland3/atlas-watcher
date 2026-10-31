@@ -83,6 +83,7 @@ def _run_manager(repo: str, sha_dir: Path, review_round: int) -> Path:
         # publishing is the harness's job (audit.sync), so an agent that has
         # just ingested untrusted upstream text never has a git remote in reach.
         cwd=sha_dir,
+        raise_on_failure=False,
     )
     log(f"manager agent={result.agent} rc={result.rc}")
 

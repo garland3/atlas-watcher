@@ -24,7 +24,7 @@ _COMMENT_RE = re.compile(
 
 
 def _build_context(repo: str, meta: dict) -> str:
-    labels = ", ".join(l["name"] for l in meta.get("labels", []))
+    labels = ", ".join(label["name"] for label in meta.get("labels", []))
     parts = [
         f"## {repo} Issue #{meta['number']} — {meta['title']}\n",
         f"**URL:** {meta['url']}",
@@ -55,7 +55,8 @@ def _generate_triage(repo: str, meta: dict, snap_dir: Path) -> None:
 
     raw_path = snap_dir / "triage.raw.md"
     result = swarm.run_role("issue-triage", full, raw_path,
-                            log_file=snap_dir / "triage.log")
+                            log_file=snap_dir / "triage.log",
+                            raise_on_failure=False)
     audit.merge_ran(snap_dir, "issue_triage",
                     {"agent": result.agent, "vendor": result.vendor})
     raw = raw_path.read_text(encoding="utf-8")
