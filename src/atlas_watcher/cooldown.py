@@ -78,6 +78,15 @@ _FALLBACK_RETRY_RE = re.compile(
 # would otherwise bury the limit message past this guard.
 LIMIT_OUTPUT_MAX = 2000
 
+# How many lines at the END of a failed agent's log count as "the CLI's own
+# error" for reset-trust purposes (see classify_limit): a stated reset is
+# honored out to the weekly ceiling only when the limit line sits within
+# this many lines of the log's end. A limit-shaped line quoted earlier in
+# the output — tool chatter, a file the agent read — can state any reset it
+# likes; downgrading that match to weak caps the pause at the ordinary
+# backoff ceiling instead of parking a vendor for days on a planted claim.
+_RESET_TAIL_LINES = 6
+
 # Anchored matching allows this many characters before the phrase, enough
 # for a prefix like "Error: " or "Claude AI " but not for a quoted mention.
 _ANCHOR_SLACK = 16
@@ -110,11 +119,13 @@ class LimitInfo:
     reason: str
     reset_ts: float | None
     # True when the match came from the explicit limit wordings (the CLIs'
-    # real messages) rather than the weak cap-word+retry-hint fallback. A
-    # *stated* reset is honored out to agent_limit_reset_max_secs (8 days,
-    # a weekly limit) only for strong matches; a weak match's reset is
-    # capped at the ordinary backoff ceiling, because a guess must not be
-    # able to park a vendor for days.
+    # real messages, sitting in the last few lines of the log — see
+    # _RESET_TAIL_LINES) rather than the weak cap-word+retry-hint fallback.
+    # A *stated* reset is honored out to agent_limit_reset_max_secs (8
+    # days, a weekly limit) only for strong matches; a weak match's reset
+    # is capped at the ordinary backoff ceiling, because a guess — or a
+    # line planted in the agent's output — must not be able to park a
+    # vendor for days.
     strong: bool = True
 
 
@@ -140,6 +151,50 @@ def echo_lines(exclude_text: str | None) -> frozenset[str]:
         return frozenset()
     return frozenset(normalize_line(line)
                      for line in exclude_text.splitlines())
+
+
+def log_tail(text: str) -> str:
+    """The last ``LIMIT_OUTPUT_MAX`` characters of a failed agent's log.
+
+    Some CLIs echo the whole prompt — diff included — into their log before
+    failing, so the CLI's own error sits at the end of an otherwise huge
+    log, past the size guard. The cut can land mid-line: the slice's first
+    line would then be a partial copy of an echoed prompt line (e.g. "…
+    aise Unauthorized") whose normalized form equals no prompt line, so it
+    would slip past the echo filter and let upstream text read as the
+    CLI's own error. The partial line is dropped — the slice's only
+    incomplete line is its first, and the CLI's own message sits at the
+    end of the log.
+    """
+    if len(text) <= LIMIT_OUTPUT_MAX:
+        return text
+    cut = len(text) - LIMIT_OUTPUT_MAX
+    mid_line_cut = text[cut - 1] != "\n"
+    text = text[cut:]
+    if mid_line_cut and "\n" in text:
+        text = text[text.index("\n") + 1:]
+    return text
+
+
+def filtered_lines(text: str, exclude_text: str | None) -> list[str]:
+    """``text``'s lines minus echoed input (see :func:`echo_lines`)."""
+    echo = echo_lines(exclude_text)
+    lines = text.splitlines()
+    if not echo:
+        return lines
+    return [line for line in lines if normalize_line(line) not in echo]
+
+
+def filtered_tail(text: str, exclude_text: str | None) -> str:
+    """The scan window for a failed agent's log: its tail, minus echo.
+
+    Shared by BOTH classifiers — :func:`classify_limit` (limit signatures)
+    and the swarm's auth classifier (auth signatures) — so a partial line
+    left by the tail cut, or an echoed prompt line, is handled identically
+    no matter which signature set scans it (see :func:`log_tail` and
+    :func:`echo_lines` for each half's rationale).
+    """
+    return "\n".join(filtered_lines(log_tail(text), exclude_text))
 
 
 def _line_match(line: str, anchored: bool) -> tuple[bool, bool]:
@@ -177,6 +232,11 @@ def classify_limit(text: str, anchored: bool = False, *,
       successful run's output is review content; the anchored rule alone is
       not enough reason to regex thousands of characters of it.
 
+    The tail cut and the echo filter are the shared :func:`log_tail` /
+    :func:`filtered_lines` helpers, so the auth classifier (which scans the
+    same window for different signatures) handles partial and echoed lines
+    exactly the same way.
+
     ``exclude_text`` (the prompt we sent, when the caller has it) marks lines
     that are echoed input: a log line whose normalized form exactly equals a
     prompt line is skipped, and the reset time is parsed only from surviving
@@ -190,26 +250,14 @@ def classify_limit(text: str, anchored: bool = False, *,
     if len(text) > LIMIT_OUTPUT_MAX:
         if anchored:
             return None
-        cut = len(text) - LIMIT_OUTPUT_MAX
-        # A tail cut can land mid-line. The first line of the slice is then
-        # a partial line (e.g. "try budget was exhausted ...") whose
-        # normalized form equals no prompt line, so it would slip past the
-        # echo filter below and plant a cooldown from echoed prompt text.
-        # Drop it: the slice's only incomplete line is its first, and the
-        # CLI's own limit message sits at the end of the log.
-        mid_line_cut = text[cut - 1] != "\n"
-        text = text[cut:]
-        if mid_line_cut and "\n" in text:
-            text = text[text.index("\n") + 1:]
-    echo = echo_lines(exclude_text)
-    lines = text.splitlines()
+        text = log_tail(text)
+    lines = filtered_lines(text, exclude_text)
     matched: list[str] = []
+    first_match = len(lines)
     strong = False
     for i, line in enumerate(lines):
         hit, is_strong = _line_match(line, anchored)
         if not hit:
-            continue
-        if echo and normalize_line(line) in echo:
             continue
         if not matched:
             # The CLI often states the reset on the line after the limit
@@ -217,9 +265,19 @@ def classify_limit(text: str, anchored: bool = False, *,
             # from the matched line plus that one neighbor, never the whole
             # tail (the tail may otherwise be echoed prompt/diff text).
             matched = [line, lines[i + 1] if i + 1 < len(lines) else ""]
+            first_match = i
         strong = strong or is_strong
     if not matched:
         return None
+    # A *stated* reset is only honored out to the weekly ceiling when the
+    # limit line sits in the last few lines of the log — where a CLI prints
+    # its own error. A strong-wording limit quoted earlier in tool output
+    # (a file the agent read, a diff it echoed) can state any reset it
+    # likes; downgrading it to a weak match caps the pause at the ordinary
+    # backoff ceiling instead of parking the vendor for days on a claim
+    # this scanner cannot verify (see _RESET_TAIL_LINES).
+    if first_match < len(lines) - _RESET_TAIL_LINES:
+        strong = False
     return LimitInfo(reason=matched[0].strip()[:200],
                      reset_ts=_parse_reset("\n".join(matched)),
                      strong=strong)
@@ -347,11 +405,13 @@ def record(vendor: str, limit: LimitInfo) -> dict:
     exponentially by consecutive limit hits (base * 2^(n-1)), capped both
     ways. The fallback cap matters because a guess must not park the vendor
     for a day: retrying early only re-detects the limit and extends. A
-    stated reset from a *strong* match (a known CLI limit wording) gets the
-    longer ``agent_limit_reset_max_secs`` ceiling, since a weekly limit
-    really does last days; a weak (fallback-heuristic) match's stated reset
-    is capped at the ordinary backoff ceiling — an unverified claim must
-    not be able to park a vendor for days.
+    stated reset from a *strong* match — a known CLI limit wording sitting
+    in the last few lines of the log, where a CLI prints its own error (see
+    classify_limit) — gets the longer ``agent_limit_reset_max_secs``
+    ceiling, since a weekly limit really does last days; a weak
+    (fallback-heuristic) match, or a strong wording quoted earlier in the
+    output, is capped at the ordinary backoff ceiling — an unverifiable
+    claim must not be able to park a vendor for days.
 
     Only ``vendor`` is paused. Roles running on other vendors keep running.
     """

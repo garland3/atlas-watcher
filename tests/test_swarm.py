@@ -328,3 +328,65 @@ def test_echoed_prompt_limit_is_not_a_limit(
     # no cooldown was planted for anthropic; the slot was stubbed instead
     assert cooldown.active_for("anthropic") is None
     assert record["security"]["stub"] is True
+
+
+def test_diversity_rerun_succeeds_on_unseen_vendor(
+        sha_dir, patch_settings, fake_binaries, no_tmux, monkeypatch,
+        cooldown_file):
+    # Every slot completes on one vendor; the diversity gate re-runs a
+    # completed slot (generic-b, whose role has a second candidate on
+    # another vendor) on an unseen vendor instead of deferring the whole PR.
+    patch_settings(perspective_agents=["dclaude"],
+                   generic_a_agents=["dclaude"],
+                   generic_b_agents=["dclaude", "cline"], min_swarm_vendors=2)
+    fake_binaries.update({"dclaude", "cline"})
+    launched: list[tuple[str, str]] = []
+
+    def launch(session, launches, checkout, context_file):
+        for pl, agent in launches:
+            launched.append((pl.perspective.name, agent))
+            _complete(pl, agent)
+
+    monkeypatch.setattr(swarm, "_launch_round", launch)
+    record = swarm.run_swarm(REPO, 1, sha_dir, sha_dir, _context(sha_dir))
+    # generic-b was re-run on the unseen vendor and the gate passed
+    assert record["generic-b"] == {"agent": "cline", "vendor": "cline"}
+    assert record["security"] == {"agent": "dclaude", "vendor": "anthropic"}
+    assert ("generic-b", "dclaude") in launched
+    assert ("generic-b", "cline") in launched
+    # the re-run's backup file was dropped once the re-run succeeded
+    assert not (sha_dir / "perspectives" / "generic-b.md.rerun-bak").exists()
+
+
+def test_diversity_rerun_failure_restores_original_findings(
+        sha_dir, patch_settings, fake_binaries, no_tmux, monkeypatch,
+        cooldown_file):
+    # A diversity re-run that fails ordinarily must not destroy the slot's
+    # original findings: they are backed up before the re-run and restored
+    # if the attempt does not finish cleanly, and the gate then defers
+    # (no stub) instead of turning a finished perspective into a stub.
+    patch_settings(perspective_agents=["dclaude"],
+                   generic_a_agents=["dclaude"],
+                   generic_b_agents=["dclaude", "cline"], min_swarm_vendors=2)
+    fake_binaries.update({"dclaude", "cline"})
+    plans = _plans(sha_dir)
+
+    def launch(session, launches, checkout, context_file):
+        for pl, agent in launches:
+            if agent == "cline":
+                # the re-run agent fails ordinarily (rc=1, no findings)
+                pl.done_path.write_text("1\n", encoding="utf-8")
+            else:
+                _complete(pl, agent)
+
+    monkeypatch.setattr(swarm, "_launch_round", launch)
+    with pytest.raises(swarm.VendorDiversityError):
+        swarm.run_swarm(REPO, 1, sha_dir, sha_dir, _context(sha_dir))
+    pl = plans["generic-b"]
+    # the original findings came back (not a stub), and the backup is gone
+    assert not (sha_dir / "perspectives" / "generic-b.md.rerun-bak").exists()
+    assert pl.findings_path.read_text().strip() == "## findings\nok"
+    assert pl.done_path.read_text().strip() == "0"
+    saved = json.loads((sha_dir / "agents.json").read_text(encoding="utf-8"))
+    assert saved["generic-b"] == {"agent": "dclaude", "vendor": "anthropic"}
+    assert "stub" not in saved["generic-b"]

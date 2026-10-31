@@ -28,7 +28,11 @@ and we move on instead of hanging forever.
 After the rounds, the swarm reports which agent/vendor produced each
 perspective (``agents.json``, merged across resumed runs) and enforces
 ``MIN_SWARM_VENDORS``: fewer distinct vendors with real findings than the
-minimum defers the item rather than posting a single-vendor review.
+minimum defers the item rather than posting a single-vendor review. A
+completed swarm that still falls short gets a bounded round of re-runs on
+unseen vendors; a re-run that fails has the slot's original findings
+restored, so an opportunistic re-run never destroys a finished
+perspective.
 """
 from __future__ import annotations
 
@@ -91,13 +95,6 @@ _AUTH_PATTERNS = (
 _AUTH_RE = re.compile("|".join(_AUTH_PATTERNS), re.IGNORECASE)
 
 
-def _tail(text: str) -> str:
-    """The tail of an agent log — where a CLI prints its own error."""
-    if len(text) <= cooldown.LIMIT_OUTPUT_MAX:
-        return text
-    return text[-cooldown.LIMIT_OUTPUT_MAX:]
-
-
 def _read_log(path: Path) -> str:
     try:
         if path.is_file():
@@ -105,27 +102,6 @@ def _read_log(path: Path) -> str:
     except OSError:
         pass
     return ""
-
-
-def _without_echo(text: str, exclude_text: str | None) -> str:
-    """Drop lines that are echoed input (see cooldown.echo_lines).
-
-    Some CLIs echo the whole prompt — diff included — into their log before
-    failing. A limit/auth-shaped line that is part of that echo is upstream
-    content, not the CLI's own error; acting on it would let a PR plant a
-    cooldown or force failover through every vendor. The match is
-    whole-line: a log line is dropped only when its normalized form exactly
-    equals one of the prompt's lines, so a CLI error that merely mentions a
-    phrase the prompt also contains still counts.
-    """
-    if not exclude_text:
-        return text
-    echo = cooldown.echo_lines(exclude_text)
-    if not echo:
-        return text
-    return "\n".join(
-        line for line in text.splitlines()
-        if cooldown.normalize_line(line) not in echo)
 
 
 def _limit_from_logs(*paths: Path, anchored: bool = False,
@@ -144,10 +120,17 @@ def _limit_from_logs(*paths: Path, anchored: bool = False,
 
 
 def _auth_from_logs(*paths: Path, exclude_text: str | None = None) -> bool:
-    """True if a *failed* attempt's log tail shows an authentication error."""
+    """True if a *failed* attempt's log tail shows an authentication error.
+
+    Scans the same shared window as the limit classifier
+    (cooldown.filtered_tail): the tail, cut at a line boundary, minus echoed
+    prompt lines — so a cut-off echoed diff line containing "Unauthorized",
+    or a PR that quotes auth errors in its text, cannot read as the CLI's
+    own auth error.
+    """
     for path in paths:
-        tail = _without_echo(_tail(_read_log(path)), exclude_text)
-        if _AUTH_RE.search(tail):
+        if _AUTH_RE.search(cooldown.filtered_tail(_read_log(path),
+                                                  exclude_text)):
             return True
     return False
 
@@ -572,8 +555,8 @@ def _classify_round(launches: list[tuple[_Plan, str]], record: dict[str, dict],
     return infra_failures
 
 
-def _diversity_rerun_targets(plans, record, seen_vendors,
-                             excluded) -> list[tuple[_Plan, str]]:
+def _diversity_rerun_targets(plans, record, seen_vendors, excluded,
+                             rerun_tried) -> list[tuple[_Plan, str]]:
     """Slots worth re-running on an unseen vendor to grow diversity.
 
     A completed swarm that falls short of MIN_SWARM_VENDORS can often still
@@ -583,9 +566,10 @@ def _diversity_rerun_targets(plans, record, seen_vendors,
     unseen vendor replaces their findings with a run on the new vendor, so
     the gate can actually be met instead of deferring forever.
 
-    Each slot is re-run at most once per pass for this purpose; a slot that
-    fails again ordinarily ends up a stub, which the shortfall check below
-    turns into a plain (retry-budgeted) failure rather than a livelock.
+    Each slot is re-run at most once per pass for this purpose
+    (``rerun_tried``); a failed attempt restores the slot's original
+    findings instead of stubbing it (see :func:`_restore_rerun_backups`),
+    so a re-run can never turn a finished perspective into a stub or loop.
     """
     minimum = settings.min_swarm_vendors
     need = minimum - len(record_vendors(record))
@@ -594,7 +578,10 @@ def _diversity_rerun_targets(plans, record, seen_vendors,
     targets: list[tuple[_Plan, str]] = []
     gained: set[str] = set()
     for pl in plans:
-        rec = record.get(pl.perspective.name)
+        name = pl.perspective.name
+        if name in rerun_tried:
+            continue  # one re-run attempt per slot per pass
+        rec = record.get(name)
         if not rec or rec.get("stub"):
             continue  # stubs are handled by the ordinary-failure branch
         agent, _reason = agents.pick(
@@ -613,6 +600,40 @@ def _diversity_rerun_targets(plans, record, seen_vendors,
         if len(targets) >= need:
             break
     return targets
+
+
+def _restore_rerun_backups(launches: list[tuple[_Plan, str]],
+                           record: dict[str, dict],
+                           rerun_backups: dict[str, tuple[Path, str, dict]],
+                           unseen_only: set[str]) -> None:
+    """Undo diversity re-runs that did not finish cleanly.
+
+    A re-run is opportunistic — it exists to grow vendor diversity, and the
+    slot it touches had already produced real findings. When the attempt
+    fails (an ordinary failure classified as a stub, or an infra failure
+    that leaves the slot pending), the backed-up findings file, completion
+    sentinel, and record entry are put back: the slot ends up exactly as it
+    was before the attempt, so a failed re-run can never replace a finished
+    perspective with a stub. An attempt that did finish cleanly keeps its
+    new findings, and its backup is discarded.
+    """
+    for pl, _agent in launches:
+        name = pl.perspective.name
+        backup = rerun_backups.pop(name, None)
+        if backup is None:
+            continue
+        findings_bak, done_text, original = backup
+        if (_agent_completed(pl.done_path, pl.findings_path)
+                and not (record.get(name) or {}).get("stub")):
+            # the re-run succeeded: keep the new findings, drop the backup
+            findings_bak.unlink(missing_ok=True)
+            continue
+        findings_bak.replace(pl.findings_path)
+        pl.done_path.write_text(done_text, encoding="utf-8")
+        record[name] = dict(original)
+        unseen_only.discard(name)
+        log(f"swarm: {name}'s diversity re-run failed — restored its "
+            f"original findings from {original.get('agent', 'unknown agent')}")
 
 
 def run_swarm(repo: str, pr_number: int, checkout: Path,
@@ -638,6 +659,12 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
     # with require_unseen_vendor so the re-run cannot just reproduce the
     # vendor the record already has.
     unseen_only: set[str] = set()
+    # Diversity re-run bookkeeping: each slot is re-run at most once per
+    # pass (rerun_tried), and each re-run's original completed state
+    # (findings file, sentinel text, record entry) is kept in rerun_backups
+    # for restore if the attempt does not finish cleanly.
+    rerun_tried: set[str] = set()
+    rerun_backups: dict[str, tuple[Path, str, dict]] = {}
     round_no = 0
 
     while True:
@@ -647,20 +674,35 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
         if not pending:
             # Every slot is resolved for this pass. A shortfall on vendor
             # diversity can still improve: re-run a bounded number of
-            # completed slots on unseen vendors before giving up. Slots that
-            # fail the re-run ordinarily become stubs, which the shortfall
-            # check below turns into a plain (retry-budgeted) failure.
+            # completed slots on unseen vendors before giving up. A re-run
+            # that fails has the slot's original findings restored
+            # (_restore_rerun_backups), so the shortfall stays a defer
+            # rather than a stub, and the slot is marked tried so the next
+            # shortfall pass gives up instead of livelocking.
             targets = _diversity_rerun_targets(plans, record, seen_vendors,
-                                               excluded)
+                                               excluded, rerun_tried)
             if targets:
                 for pl, agent in targets:
-                    log(f"swarm: re-running {pl.perspective.name} on "
-                        f"{agent} ({agents.vendor_of(agent)}) to reach "
-                        f"vendor diversity")
+                    name = pl.perspective.name
+                    log(f"swarm: re-running {name} on {agent} "
+                        f"({agents.vendor_of(agent)}) to reach vendor "
+                        f"diversity")
+                    # Keep the slot's completed state aside: a re-run that
+                    # fails must not turn a real perspective into a stub (or
+                    # erase the vendor it came from).
+                    findings_bak = pl.findings_path.with_suffix(
+                        pl.findings_path.suffix + ".rerun-bak")
+                    pl.findings_path.replace(findings_bak)
+                    rerun_backups[name] = (
+                        findings_bak,
+                        pl.done_path.read_text(encoding="utf-8")
+                        if pl.done_path.is_file() else "0\n",
+                        dict(record.get(name) or {}),
+                    )
                     pl.done_path.unlink(missing_ok=True)
-                    pl.findings_path.unlink(missing_ok=True)
-                    record.pop(pl.perspective.name, None)
-                    unseen_only.add(pl.perspective.name)
+                    record.pop(name, None)
+                    unseen_only.add(name)
+                    rerun_tried.add(name)
                 seen_vendors = record_vendors(record)
                 continue
             break
@@ -696,10 +738,17 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
         _wait_round(session, launches)
         failures = _classify_round(launches, record, seen_vendors, excluded,
                                    resolved)
+        _restore_rerun_backups(launches, record, rerun_backups, unseen_only)
         _save_record(out_dir, record)
         unseen_only -= resolved
         if failures == 0:
-            break
+            # Every launched slot resolved cleanly this pass. A vendor-
+            # diversity shortfall can still improve from here: the loop head
+            # checks for re-run targets when pending is empty, so fall
+            # through to it instead of breaking on the first shortfall pass
+            # (the old break deferred every under-diversified swarm at
+            # least once).
+            continue
 
     if not any(not rec.get("stub") for rec in record.values()):
         raise RuntimeError(
