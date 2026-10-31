@@ -1,14 +1,29 @@
-"""Global cooldown after a detected agent rate/session limit.
+"""Per-agent (per-vendor) cooldown after a detected rate/session limit.
 
-A rate limit is account-wide, not per item: when one agent reports it, every
-other agent will hit the same wall until it resets. The watcher runs
-unattended on cron, so recovery must be automatic — this module makes the
-whole pass skip itself until the limit expires, rather than launching swarms
-that are guaranteed to fail and recording failures the item did not cause.
+A rate limit is account-wide, and accounts belong to vendors: when one
+vendor's agent reports a limit, every OTHER vendor can keep working. So the
+cooldown is keyed by **vendor** (``anthropic``, ``openai``, ``xai``, ...),
+not held as one global pause:
+
+- a limit on vendor X pauses only X;
+- a role pauses only when *every* candidate for it is cooling down, and it
+  resumes at the earliest reset among them (see
+  :func:`atlas_watcher.agents.pick`);
+- a scan pass stops only when no role can run at all.
 
 The cooldown is runtime state, not record: it lives in a gitignored file
 under ``logs/`` (see :func:`paths.cooldown_file`). It is never written to the
 audit repo, and it expires on its own, so no operator has to clear it.
+
+State format (v2)::
+
+    {"agents": {"<vendor>": {"until_ts": ..., "set_at": ...,
+                             "consecutive": N, "reason": "..."}}}
+
+A legacy v1 file (a single flat state from before per-agent cooldowns) is
+honored as a cooldown on the reserved vendor key ``"*"`` — i.e. the old
+global pause keeps pausing everything until it expires, and new records are
+per-vendor from then on.
 """
 from __future__ import annotations
 
@@ -23,10 +38,14 @@ from .config import settings
 from .log import log
 from .paths import cooldown_file
 
+# Reserved vendor key for a pre-per-agent (global) cooldown read from a
+# legacy v1 state file. It cools every vendor until it expires.
+LEGACY_ALL = "*"
+
 # Phrases that mean "the account is capped", case-insensitive. Kept specific:
 # a rate-limit message is the whole (short) output of a failed agent, whereas
 # a successful summary or findings file may legitimately *discuss* rate
-# limiting. The size guard in :func:`classify_limit` and the "only failed
+# limiting. The tail-scan in :func:`classify_limit` and the "only failed
 # agents" rule in the swarm are what keep this from misfiring on reviewed
 # code that talks about 429s.
 # The window name is free-form because the CLIs keep renaming it: "session",
@@ -53,8 +72,11 @@ _FALLBACK_RETRY_RE = re.compile(
 )
 
 # A real limit message is a line or two; a genuine summary/findings file is
-# long. Output past this size is treated as content, not an error.
-_LIMIT_OUTPUT_MAX = 2000
+# long. Output past this size is treated as content, not an error — except
+# that a *failed* agent's log is scanned in its tail (see classify_limit),
+# because some CLIs echo the whole prompt into the log before failing, which
+# would otherwise bury the limit message past this guard.
+LIMIT_OUTPUT_MAX = 2000
 
 # Anchored matching allows this many characters before the phrase, enough
 # for a prefix like "Error: " or "Claude AI " but not for a quoted mention.
@@ -109,10 +131,25 @@ def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
     citing another bot's "usage limit reached" PR comment. Unanchored
     matching (failed agents only) also applies the unknown-wording fallback.
 
+    Long text is handled differently by mode:
+
+    - *failed* agents (unanchored): only the **tail** is scanned. Some CLIs
+      echo the whole prompt into their log before failing — codex does — so
+      the limit message sits at the end of an otherwise huge log, past the
+      size guard. Scanning the tail finds it without exposing the scanner to
+      quoted limit talk in the middle of real content.
+    - *successful* agents (anchored): long output is not scanned at all. A
+      successful run's output is review content; the anchored rule alone is
+      not enough reason to regex thousands of characters of it.
+
     Pure: never writes state. Callers decide whether to record a cooldown.
     """
-    if not text or len(text) > _LIMIT_OUTPUT_MAX:
+    if not text:
         return None
+    if len(text) > LIMIT_OUTPUT_MAX:
+        if anchored:
+            return None
+        text = text[-LIMIT_OUTPUT_MAX:]
     for line in text.splitlines():
         if _line_matches(line, anchored):
             return LimitInfo(reason=line.strip()[:200],
@@ -179,39 +216,77 @@ def _ts(dt: datetime) -> float:
     return (dt if dt.tzinfo else dt.astimezone()).timestamp()
 
 
-def read() -> dict | None:
+def _load() -> dict[str, dict]:
+    """All stored cooldown states keyed by vendor, honoring the v1 format."""
     path = cooldown_file()
     if not path.is_file():
-        return None
+        return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    agents = raw.get("agents")
+    if isinstance(agents, dict):
+        return {str(k): v for k, v in agents.items() if isinstance(v, dict)}
+    # Legacy v1: one flat global state. Keep it cooling everything until it
+    # expires rather than silently dropping a pause that is still in force.
+    if "until_ts" in raw:
+        return {LEGACY_ALL: raw}
+    return {}
 
 
-def active() -> dict | None:
-    """The cooldown if it is still in force; expired state self-clears."""
-    state = read()
-    if not state:
-        return None
+def _save(states: dict[str, dict]) -> None:
+    path = cooldown_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"agents": states}, indent=2), encoding="utf-8")
+
+
+def _live(state: dict) -> dict | None:
+    """The state if it is still in force; expired state self-clears."""
     if float(state.get("until_ts", 0)) <= time.time():
-        clear()
         return None
     return state
 
 
-def record(limit: LimitInfo) -> dict:
-    """Persist a cooldown for a detected limit and return the new state.
+def active_for(vendor: str) -> dict | None:
+    """The cooldown state for ``vendor`` if one is in force, else None.
+
+    Also honors a legacy global (``"*"``) cooldown.
+    """
+    states = _load()
+    for key in (vendor, LEGACY_ALL):
+        state = states.get(key)
+        if state and (live := _live(state)):
+            return live
+    return None
+
+
+def active_all() -> dict[str, dict]:
+    """Every cooldown still in force, keyed by vendor (legacy one under "*")."""
+    states = _load()
+    live = {vendor: s for vendor, s in states.items() if _live(s)}
+    if len(live) != len(states):
+        _save(live)
+    return live
+
+
+def record(vendor: str, limit: LimitInfo) -> dict:
+    """Persist a cooldown for ``vendor`` and return the new state.
 
     Honors the agent's stated reset time when it parses, otherwise backs off
     exponentially by consecutive limit hits (base * 2^(n-1)), capped both
-    ways. The fallback cap matters because a guess must not park the watcher
+    ways. The fallback cap matters because a guess must not park the vendor
     for a day: retrying early only re-detects the limit and extends. A stated
     reset gets the longer ``agent_limit_reset_max_secs`` ceiling, since a
     weekly limit really does last days.
+
+    Only ``vendor`` is paused. Roles running on other vendors keep running.
     """
     now = time.time()
-    prev = read()
+    states = _load()
+    prev = states.get(vendor)
     consecutive = 1
     if prev and now - float(prev.get("set_at", 0)) < settings.agent_limit_backoff_max_secs:
         consecutive = int(prev.get("consecutive", 0)) + 1
@@ -229,12 +304,28 @@ def record(limit: LimitInfo) -> dict:
         "consecutive": consecutive,
         "reason": limit.reason,
     }
-    cooldown_file().parent.mkdir(parents=True, exist_ok=True)
-    cooldown_file().write_text(json.dumps(state, indent=2), encoding="utf-8")
-    log(f"agent limit detected ({limit.reason!r}); pausing until "
+    states[vendor] = state
+    _save(states)
+    log(f"agent limit detected on vendor {vendor!r} ({limit.reason!r}); "
+        f"pausing {vendor} until "
         f"{datetime.fromtimestamp(until, tz=UTC).astimezone().isoformat(timespec='seconds')} "
         f"(consecutive={consecutive})")
     return state
+
+
+def earliest_reset(vendors) -> float | None:
+    """When the earliest of these vendors' cooldowns lifts, or None.
+
+    A role blocked on cooldown resumes at the earliest reset among its
+    candidates; a whole pass resumes when the earliest blocked role can run.
+    """
+    states = _load()
+    resets = []
+    for vendor in vendors:
+        state = states.get(vendor) or states.get(LEGACY_ALL)
+        if state and (live := _live(state)):
+            resets.append(float(live["until_ts"]))
+    return min(resets) if resets else None
 
 
 def clear() -> None:

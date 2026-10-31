@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 
 import typer
 
-from . import audit, cooldown, gh, issue as issue_mod, ledger as ledger_mod, pr as pr_mod
+from . import agents, audit, cooldown, gh, issue as issue_mod, ledger as ledger_mod, pr as pr_mod
 from .config import settings
 from .log import log
 from .paths import data_root
@@ -61,9 +61,10 @@ def _scan_repo(repo: str, dry_run: bool) -> None:
         log(f"{repo}: list PRs failed: {e!r}")
         prs = []
     for n in prs:
-        if cooldown.active():
-            log(f"{repo}: agent limit active — stopping this pass")
+        if _blocked_pass():
             return
+        if _skip_item(repo, f"PR #{n}", agents.PR_ROLES):
+            continue
         try:
             pr_mod.process(repo, n, dry_run=dry_run)
         except Exception as e:
@@ -75,26 +76,58 @@ def _scan_repo(repo: str, dry_run: bool) -> None:
         log(f"{repo}: list issues failed: {e!r}")
         issues = []
     for n in issues:
-        if cooldown.active():
-            log(f"{repo}: agent limit active — stopping this pass")
+        if _blocked_pass():
             return
+        if _skip_item(repo, f"issue #{n}", agents.ISSUE_ROLES):
+            continue
         try:
             issue_mod.process(repo, n, dry_run=dry_run)
         except Exception as e:
             log(f"{repo} issue #{n} failed: {e!r}")
 
 
+def _blocked_pass() -> bool:
+    """True when no role can run at all — the only thing that stops a pass.
+
+    Per-vendor cooldowns pause individual roles, not the whole watcher; the
+    pass only stops when every role's candidate list is cooling down.
+    """
+    if agents.block_reason(agents.ALL_ROLES) != "cooldown":
+        return False
+    reset = agents.earliest_reset(agents.ALL_ROLES)
+    until = (datetime.fromtimestamp(reset, tz=UTC).astimezone()
+             .isoformat(timespec="seconds") if reset else "unknown")
+    log(f"every role's agents are cooling down — stopping this pass "
+        f"(earliest reset {until})")
+    return True
+
+
+def _skip_item(repo: str, label: str, roles: tuple[str, ...]) -> bool:
+    """True if some role this item needs is fully cooling down.
+
+    The item is skipped WITHOUT a ledger row: like the old global-cooldown
+    gate, this is a self-healing pause, not a failure. Roles blocked by
+    missing binaries are NOT skipped here — the run raises a real error so
+    the misconfiguration surfaces in the ledger and logs.
+    """
+    reason = agents.block_reason(roles)
+    if reason != "cooldown":
+        return False
+    reset = agents.earliest_reset(roles)
+    until = (datetime.fromtimestamp(reset, tz=UTC).astimezone()
+             .isoformat(timespec="seconds") if reset else "unknown")
+    log(f"{repo} {label}: some roles' agents are cooling down — skipping "
+        f"until {until}")
+    return True
+
+
 def _one_pass(dry_run: bool) -> None:
-    state = cooldown.active()
-    if state:
-        until = datetime.fromtimestamp(state["until_ts"], tz=UTC).astimezone().isoformat(timespec="seconds")
-        log(f"agent cooldown active until {until} — skipping pass")
+    if _blocked_pass():
         return
     log(f"scan start: {len(settings.repos)} repo(s) — {settings.repos}")
     for repo in settings.repos:
         _scan_repo(repo, dry_run)
-        if cooldown.active():
-            log("agent limit hit mid-pass — stopping scan")
+        if _blocked_pass():
             break
     if not dry_run:
         try:
@@ -137,24 +170,28 @@ def sync() -> None:
 @app.command("cooldown")
 def cooldown_cmd(
     clear: bool = typer.Option(False, "--clear",
-                               help="Clear an active cooldown (debugging only)."),
+                               help="Clear active cooldowns (debugging only)."),
 ) -> None:
-    """Show the global agent rate-limit cooldown.
+    """Show the per-vendor agent rate-limit cooldowns.
 
-    Recovery is automatic: the cooldown expires and the next scan resumes on
-    its own. --clear exists only for debugging a stuck timer.
+    Cooldowns are keyed by vendor: a limit on one vendor pauses only that
+    vendor. Recovery is automatic — each expires on its own and the next
+    scan resumes. --clear exists only for debugging stuck timers.
     """
     if clear:
         cooldown.clear()
-        typer.echo("cooldown cleared")
+        typer.echo("cooldowns cleared")
         return
-    state = cooldown.active()
-    if not state:
+    states = cooldown.active_all()
+    if not states:
         typer.echo("no active cooldown")
         return
-    until = datetime.fromtimestamp(state["until_ts"], tz=UTC).astimezone().isoformat(timespec="seconds")
-    typer.echo(f"cooldown until {until} (consecutive={state.get('consecutive')})")
-    typer.echo(f"reason: {state.get('reason')}")
+    for vendor, state in sorted(states.items()):
+        until = (datetime.fromtimestamp(state["until_ts"], tz=UTC)
+                 .astimezone().isoformat(timespec="seconds"))
+        typer.echo(f"{vendor}: cooldown until {until} "
+                   f"(consecutive={state.get('consecutive')})")
+        typer.echo(f"  reason: {state.get('reason')}")
 
 
 @app.command("audit-init")

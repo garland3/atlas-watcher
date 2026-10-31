@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from . import swarm
+from . import agents, swarm
 from .config import settings
 from .log import log
 from .paths import PROMPTS
@@ -261,16 +261,22 @@ def _run_model_verdict(text: str, snap_dir: Path) -> dict[str, Any]:
     prompt = template.replace("{UNTRUSTED}", capped)
 
     out_path = snap_dir / "security.raw.txt"
-    log_path = snap_dir / "security.log"
-    rc = swarm.run_single(
-        "dclaude", prompt,
+    result = swarm.run_role(
+        "security-triage", prompt,
         out_file=out_path,
-        log_file=log_path,
+        log_file=snap_dir / "security.log",
         cwd=None,
     )
     raw = out_path.read_text(encoding="utf-8") if out_path.is_file() else ""
     verdict = _parse_model_output(raw)
-    verdict["agent_rc"] = rc
+    verdict["agent_rc"] = result.rc
+    # Models score risk differently. Record which agent produced the
+    # verdict — and whether it was a fallback — so a weaker failover
+    # verdict is traceable (and handled more cautiously, see assess).
+    verdict["agent"] = result.agent
+    verdict["vendor"] = result.vendor
+    verdict["agent_fallback"] = (
+        result.agent != agents.role_candidates("security-triage")[0])
     return verdict
 
 
@@ -350,6 +356,26 @@ def assess(repo: str, kind: str, number: int, text: str,
         log(f"security: {kind} #{number} block downgraded to warn — "
             f"uncorroborated single signal {heur.get('signals')}")
 
+    # A fallback triage model may score risk differently (usually more
+    # leniently) than the primary — and a *clean-looking* verdict from an
+    # unfamiliar model is exactly where under-scoring would hide. Lean
+    # toward warning more, not less (rule 12c): when the verdict came from a
+    # fallback agent and ANY signal is nonzero (model score or a heuristic),
+    # do not proceed silently — a banner is cheap, a missed injection is
+    # not. Blocks are NOT manufactured here; the existing corroboration
+    # rules still govern those.
+    upgraded = False
+    if decision == "proceed" and model.get("agent_fallback"):
+        weak_signal = (int(model.get("score") or 0) > 0
+                       or bool(heur.get("signals")))
+        if weak_signal:
+            decision = "warn"
+            upgraded = True
+            log(f"security: {kind} #{number} proceed upgraded to warn — "
+                f"triage ran on fallback agent {model.get('agent')} "
+                f"(model score {model.get('score')}, "
+                f"signals {heur.get('signals')})")
+
     verdict = {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "repo": repo,
@@ -359,6 +385,7 @@ def assess(repo: str, kind: str, number: int, text: str,
         "final_score": final_score,
         "decision": decision,
         "block_downgraded_to_warn": downgraded,
+        "fallback_upgraded_to_warn": upgraded,
         "model_verdict": model,
         "heuristic_verdict": heur,
         "thresholds": {
@@ -381,11 +408,25 @@ def _write_human_readable(snap_dir: Path, verdict: dict[str, Any]) -> None:
         f"- **Final risk:** `{verdict['final_risk']}` (score {verdict['final_score']})",
         f"- **Thresholds:** warn ≥ `{verdict['thresholds']['warn_above']}`, block ≥ `{verdict['thresholds']['block_above']}`",
     ]
+    triage_agent = verdict["model_verdict"].get("agent")
+    if triage_agent:
+        lines.append(
+            f"- **Triage agent:** `{triage_agent}` "
+            f"(vendor `{verdict['model_verdict'].get('vendor')}`)"
+            + (" — **fallback**, not the primary triage agent"
+               if verdict["model_verdict"].get("agent_fallback") else ""))
     if verdict.get("block_downgraded_to_warn"):
         lines.append(
             "- **Downgraded:** score reached the block band on a single "
             "uncorroborated heuristic signal, so this was reduced to `warn` "
             "(reviewed with a banner) rather than dropped silently."
+        )
+    if verdict.get("fallback_upgraded_to_warn"):
+        lines.append(
+            "- **Upgraded:** the triage model was a fallback (primary was "
+            "unavailable) and was not a clean low, so `proceed` was raised "
+            "to `warn` — different models score risk differently, and the "
+            "cheap direction is the banner."
         )
     lines += [
         "",

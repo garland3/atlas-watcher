@@ -22,7 +22,8 @@ subcommand.
    `issue <n>`) default to the first repo in `$REPOS`; pass `--repo
    owner/name` to target a different one.
 2. **Security triage runs first** for every PR and issue, before the swarm
-   or triage agent starts. A single `dclaude` invocation classifies the
+   or triage agent starts. A single agent invocation (the first available
+   candidate from `SECURITY_TRIAGE_AGENTS`) classifies the
    upstream-controlled text (PR title + body + comments, or issue title +
    body + comments) into a JSON verdict — see `prompts/security-triage.md` and
    `src/atlas_watcher/security.py`. The model verdict is combined with
@@ -49,34 +50,41 @@ subcommand.
 3. For each unreviewed **PR**, it checks out the head commit and launches an
    **9-agent swarm in tmux**, in parallel — one tmux window per agent in a
    single session:
-   - 7 windows running `dclaude` on specific perspectives:
+   - 7 windows on specific perspectives (role: `PERSPECTIVE_AGENTS`):
      security, correctness, architecture, testing, performance, ux, and
      evidence. The **evidence** perspective does not hunt for defects — it
      scores 1–10 how well the PR demonstrates that the change works (e2e
      screenshots, tests, verification steps), with the bar scaled to the
      size of the change, reading the PR description and comments as well as
      the diff.
-   - 1 window running `codex` on the **generic** review prompt
-     (`prompts/generic-review.md`) — flags anything it thinks matters.
-   - 1 window running `cline` on the same **generic** review prompt.
+   - 1 window on the **generic** review prompt
+     (`prompts/generic-review.md`) — flags anything it thinks matters
+     (role: `GENERIC_A_AGENTS`).
+   - 1 window on the same **generic** review prompt
+     (role: `GENERIC_B_AGENTS`).
+   Each window runs the first available candidate from its role's fallback
+   list; an infrastructure failure (agent limit, auth error, missing
+   binary) re-runs that slot on the next candidate, in failover rounds.
    Each agent is told the exact path of the markdown findings file it
    must write (under `reviews/prs/PR-<n>/<sha>/perspectives/<name>.md`),
    and uses its own file-write tool to do so. Stdout/stderr are kept only
    as a debug transcript under `.logs/`.
 4. Once all 9 finish (we block on per-agent sentinel files), a **manager
    agent** (the orchestrator; prompt: `prompts/manager.md`) reads every
-   perspective file and writes the combined `summary.md`. Which CLI runs it
-   is set by `MANAGER_AGENT` — any of `dclaude`, `codex`, `cline`,
+   perspective file and writes the combined `summary.md`. Which CLIs may
+   run it is set by `MANAGER_AGENTS` (ordered fallback list; the legacy
+   `MANAGER_AGENT` still works) — any of `dclaude`, `codex`, `cline`,
    `opencode`, or a name registered in `AGENT_COMMANDS`; switching it is a
-   config-only change. The tracked `config.env` currently uses `dclaude`
-   (the Claude CLI). That is
+   config-only change. The tracked `config.env` runs `dclaude` first, with
+   `codex` and `opencode-grok` as failovers. That is
    all the manager does — it has no shell/git step and is not given the
    audit repo as its cwd, so an agent that has just ingested untrusted
    upstream text never has a git remote in reach. The harness then scrubs
    `summary.md` (defense in depth), appends the bot signature, posts the
    comment upstream via `gh`, and calls `audit.sync()` to publish the whole
    review folder plus the new ledger row.
-5. For each unreviewed **issue**, a single triage agent (`dclaude`) produces:
+5. For each unreviewed **issue**, a single triage agent (the first
+   available candidate from `ISSUE_TRIAGE_AGENTS`) produces:
    - a long internal analysis (archived in the audit repo, never posted), and
    - a short, human-sounding clarifying question, posted **only if** the
      issue is too vague to act on. If the issue is already clear, no
@@ -98,9 +106,10 @@ subcommand.
    `MAX_RETRIES` failures at the same key the item is skipped until the key
    changes or the `failed` rows are removed. An account-wide agent
    rate/session limit is treated differently: it is recorded as `deferred`
-   (never counted against the retry budget), sets a global cooldown, and
-   the next scan resumes on its own once the cooldown expires — the watcher
-   runs unattended, so no recovery step requires a human.
+   (never counted against the retry budget), sets a **per-vendor** cooldown
+   (only that vendor's agents pause), and the next scan resumes on its own
+   once the cooldown expires — the watcher runs unattended, so no recovery
+   step requires a human.
 
 ---
 
@@ -111,7 +120,8 @@ output from a single neutral review bot. They must **never**:
 
 - Mention or hint at the underlying model, vendor, or tool: `claude`,
   `anthropic`, `codex`, `openai`, `gpt`, `chatgpt`, `cline`, `opencode`,
-  `openrouter`, `llm`, `language model`, `as an ai`, `i am an ai`, etc.
+  `openrouter`, `grok`, `xai`, `llm`, `language model`, `as an ai`,
+  `i am an ai`, etc.
 - Refer to "the perspectives", "the swarm", "the reviewers", or the
   pipeline. Each comment is one voice.
 - Apologize for being automated, refuse on policy grounds, or include
@@ -153,14 +163,16 @@ atlas-watcher/
 │   ├── __init__.py
 │   ├── cli.py                      # Typer app — every subcommand
 │   ├── config.py                   # Settings model (config.env loader)
-│   ├── cooldown.py                 # global pause after an agent rate limit
+│   ├── agents.py                   # agent registry: commands, vendors,
+│   │                               #   role fallback lists, preflight, picking
+│   ├── cooldown.py                 # per-vendor pause after an agent rate limit
 │   ├── paths.py                    # filesystem layout
 │   ├── log.py                      # rich console logger
 │   ├── ledger.py                   # append + has_done over ledger.jsonl
 │   ├── scrub.py                    # scrub_identity, sign_comment
 │   ├── gh.py                       # gh CLI wrappers (list/view/comment)
 │   ├── git.py                      # PR checkout / diff helpers
-│   ├── swarm.py                    # 9-agent tmux orchestrator + run_single
+│   ├── swarm.py                    # 9-agent tmux orchestrator + run_role
 │   ├── post.py                     # only path to gh ... comment (signs body)
 │   ├── pr.py                       # process(pr_number)
 │   ├── issue.py                    # process(issue_number)
@@ -194,6 +206,7 @@ ATLAS-WATCHER-LOGS/
 │   │   ├── metadata.json
 │   │   ├── context.md              # PR description + comments + diff fed to agents
 │   │   ├── diff.patch
+│   │   ├── agents.json             # which agent/vendor produced each perspective
 │   │   ├── perspectives/           # one markdown file per agent, written
 │   │   │   ├── security.md         #   by the agent itself via its file-
 │   │   │   ├── correctness.md      #   write tool (NOT stdout redirection)
@@ -202,12 +215,12 @@ ATLAS-WATCHER-LOGS/
 │   │   │   ├── performance.md
 │   │   │   ├── ux.md
 │   │   │   ├── evidence.md          # sufficiency-of-evidence score + gaps
-│   │   │   ├── generic-a.md         # codex, generic prompt
-│   │   │   ├── generic-b.md         # cline, generic prompt
+│   │   │   ├── generic-a.md         # generic prompt (role generic-a)
+│   │   │   ├── generic-b.md         # generic prompt (role generic-b)
 │   │   │   ├── .runners/<name>.sh  # one launcher script per agent
 │   │   │   ├── .sentinels/<name>.done
-│   │   │   └── .logs/<name>.{stdout,stderr}.log
-│   │   ├── manager.log             # manager agent stderr
+│   │   │   └── .logs/<name>.<agent>.{stdout,stderr}.log
+│   │   ├── manager.<agent>.log     # manager agent stderr (per attempt)
 │   │   ├── manager.stdout.log      # manager agent stdout (one-line summary)
 │   │   ├── summary.md              # what gets posted (after scrub, before signature)
 │   │   └── posted.json             # GitHub comment URL
@@ -227,9 +240,12 @@ Everything under `perspectives/.runners/`, `.sentinels/`, `.logs/`, plus
 runtime transcripts, not record: they never pass through `scrub.py`, so they
 can carry model/vendor identity. They stay on disk for debugging and are
 never committed. Dropping them cut the tracked file count from 28,641 to
-8,655. The durable record is `metadata.json`, `context.md`, `diff.patch`,
-`perspectives/*.md`, `security.{json,md}`, `summary.md`, `analysis.md`,
-`comment.md`, `posted.json`, `blocked.json` and the ledger.
+8,655. The durable record is `metadata.json` (including its `ran` section,
+which deliberately records the agent/vendor behind each perspective, the
+manager summary and the security verdict — audit repo only, never posted),
+`agents.json`, `context.md`, `diff.patch`, `perspectives/*.md`,
+`security.{json,md}`, `summary.md`, `analysis.md`, `comment.md`,
+`posted.json`, `blocked.json` and the ledger.
 
 ---
 
@@ -258,10 +274,11 @@ uv run atlas-watcher cooldown            # show the agent rate-limit cooldown
 ```
 
 `cooldown --clear` exists only to debug a stuck timer; recovery is
-automatic. A swarm is **resumable**: an agent whose sentinel exists with
-`rc=0` and whose findings file is real is not re-run, so a retry after a
-manager failure (or a rate-limit pause) re-executes only the agents that
-actually need it, not the whole 9-agent swarm.
+automatic. Cooldowns are shown **per vendor** (the accounts behind the
+agents), not as one global switch. A swarm is **resumable**: an agent whose
+sentinel exists with `rc=0` and whose findings file is real is not re-run,
+so a retry after a manager failure (or a rate-limit pause) re-executes only
+the agents that actually need it, not the whole 9-agent swarm.
 
 Watch a live swarm from another shell:
 
@@ -296,14 +313,37 @@ the repo field is load-bearing.
   The counter resets naturally when the key changes; to force a retry at
   the same key, delete that item's `failed` rows from the ledger.
 - **Agent rate/session limits are not failures.** `run_swarm` and
-  `run_single` scan agent output for a limit, record a global cooldown
-  (`cooldown.py`), and raise `AgentLimitError`; `process()` then writes a
-  `deferred` row. Deferred rows are neither terminal nor counted by
-  `failure_count`, so the item retries automatically after the cooldown
-  expires. `scan` checks the cooldown before each item (and between repos),
-  so a mid-pass limit stops the pass instead of launching doomed swarms.
-  Nothing here needs a human: the cooldown self-expires and the next cron
-  pass picks up where this one stopped.
+  `run_role` scan an agent's failed logs for a limit (scanning the *tail*,
+  so a CLI that echoes its prompt — codex — cannot bury the message), record
+  a **per-vendor** cooldown (`cooldown.py`), and raise `AgentLimitError`;
+  `process()` then writes a `deferred` row. Deferred rows are neither
+  terminal nor counted by `failure_count`, so the item retries
+  automatically after the cooldown expires. `scan` checks before each item
+  whether every role it needs still has an available candidate; an item
+  whose roles are all cooling is skipped without a ledger row, and the pass
+  itself stops only when NO role can run. Nothing here needs a human: the
+  cooldown self-expires and the next cron pass picks up where this one
+  stopped.
+
+- **Failover is per role and infrastructure-only.** Each role takes an
+  ordered fallback list (`PERSPECTIVE_AGENTS`, `GENERIC_A_AGENTS`,
+  `GENERIC_B_AGENTS`, `MANAGER_AGENTS`, `SECURITY_TRIAGE_AGENTS`,
+  `ISSUE_TRIAGE_AGENTS`). A role fails over to its next candidate only on
+  an *infrastructure* failure: an agent limit, an authentication error, or
+  a missing binary (preflighted with `command -v` before launch, so a
+  missing CLI never even starts). Ordinary failures — a crash, a timeout,
+  an unparseable verdict — never fail over: a PR that happens to break one
+  model must not burn every other vendor's quota in turn. A missing binary
+  on the *last* candidate is a configuration error and fails the run
+  normally (a `failed` row), so it surfaces instead of looping forever.
+
+- **Vendor diversity gates the manager.** After the swarm finishes, if the
+  perspectives produced real findings on fewer than `MIN_SWARM_VENDORS`
+  distinct vendors, the item is recorded as `deferred` (not `failed`, and
+  nothing is posted) rather than shipping a single-vendor review. Stubs
+  never count toward diversity; the manager never counts (it summarizes).
+  `agents.json` in the review folder records which agent/vendor produced
+  each perspective, merged across resumed runs.
 
 Backward compat: ledger rows written before the multi-repo migration have
 no `repo` field. They are treated as belonging to the **first** repo in
@@ -365,17 +405,29 @@ Everything tunable lives in `config.env`. Override locally with
   code repo root; empty means `<code root>/audit-data`. Default
   `../ATLAS-WATCHER-LOGS`.
 - `BOT_NAME` — signature line on every comment. Default `AGENT-REVIEW-BOT-3`.
-- `MANAGER_AGENT` — which CLI runs the manager (the orchestrator that writes
-  the combined summary). One of the built-ins (`dclaude`, `codex`, `cline`,
-  `opencode`) or a name registered in `AGENT_COMMANDS`. Switching it requires
-  no code change. The tracked default is `dclaude`.
+- `MANAGER_AGENTS` — ordered fallback list of CLIs that can run the manager
+  (the orchestrator that writes the combined summary). Entries are
+  built-ins (`dclaude`, `codex`, `cline`, `opencode`) or names registered
+  in `AGENT_COMMANDS`. Supersedes `MANAGER_AGENT`, which is still honored
+  when this is unset. Switching it requires no code change. The tracked
+  default is `dclaude,codex,opencode-grok`.
+- `PERSPECTIVE_AGENTS`, `GENERIC_A_AGENTS`, `GENERIC_B_AGENTS`,
+  `SECURITY_TRIAGE_AGENTS`, `ISSUE_TRIAGE_AGENTS` — the same idea for the
+  other roles: ordered fallback lists. Defaults are the legacy single
+  agents (`dclaude` / `codex` / `cline`).
+- `MIN_SWARM_VENDORS` — minimum distinct vendors that must produce real
+  findings before the manager runs; below it the item is deferred instead
+  of posted. Default 2. Set to 1 to restore single-vendor posting.
 - `DCLAUDE_CMD`, `CODEX_CMD`, `CLINE_CMD`, `OPENCODE_CMD` — the agent CLIs.
   Override if your binary names differ. `dclaude` defaults to
   `claude --dangerously-skip-permissions --print`; `opencode` defaults to
   `opencode run --model openrouter/openrouter/auto --auto` (OpenRouter Auto
   Router).
 - `AGENT_COMMANDS` — optional JSON object mapping extra agent names to CLI
-  commands, e.g. `{"gemini": "gemini --approval-mode yolo"}`. A key may also
+  commands, e.g. `{"gemini": "gemini --approval-mode yolo"}`. A value may
+  also be an object declaring the vendor behind the command:
+  `{"opencode-grok": {"command": "opencode run --model
+  openrouter/x-ai/grok-4.7 --auto", "vendor": "xai"}}`. A key may also
   shadow a built-in to repoint it. This is how "something else" becomes an
   orchestrator with a config-only change.
 - `AGENT_TIMEOUT_SECS` — per-agent wall-clock cap. Default 1800.
@@ -387,8 +439,9 @@ Everything tunable lives in `config.env`. Override locally with
 - `RETRY_BACKOFF_BASE_SECS`, `RETRY_BACKOFF_MAX_SECS` — per-item retry
   backoff: after a failure, the next attempt waits
   `base * 2^(failures-1)` seconds (capped). Defaults 900 / 86400.
-- `AGENT_LIMIT_BACKOFF_SECS`, `AGENT_LIMIT_BACKOFF_MAX_SECS` — global
-  cooldown set when an agent reports a rate/session limit. The agent's
+- `AGENT_LIMIT_BACKOFF_SECS`, `AGENT_LIMIT_BACKOFF_MAX_SECS` — per-vendor
+  cooldown set when an agent reports a rate/session limit. Only the hit
+  vendor's agents pause; roles on other vendors keep running. The agent's
   stated reset time is honored when it parses; otherwise the pause backs
   off exponentially, capped at the max. Defaults 3600 / 21600.
 - `AGENT_LIMIT_RESET_MAX_SECS` — ceiling on a reset time the agent stated
@@ -424,10 +477,11 @@ there (with a default) before referencing them.
 2. **Identity invariants are tested in three places** — change all three
    when adding a forbidden term (see "Identity rules" above).
 3. **Don't add new agents lightly.** The swarm size is fixed at 9 by user
-   spec: 7 dclaude on specific perspectives (security, correctness,
-   architecture, testing, performance, ux, evidence) + 1 codex + 1 cline
-   running the shared generic prompt. If you change the count, update this
-   file, `swarm.py::PERSPECTIVES`, and add/remove the corresponding
+   spec: 7 agents on specific perspectives (security, correctness,
+   architecture, testing, performance, ux, evidence) + 2 running the shared
+   generic prompt. Fallback lists change *which CLI* fills each slot, never
+   how many slots there are. If you change the count, update this file,
+   `swarm.py::PERSPECTIVES`, and add/remove the corresponding
    `prompts/*.md` together.
 4. **Keep specific-perspective prompts strictly scoped.** Cross-cutting
    findings are the synthesizer's job, not any single specialist's. The
@@ -484,13 +538,18 @@ there (with a default) before referencing them.
     *precise* enough to block (bidi overrides, repeated prose directives)
     or explicitly marked non-decisive — don't add a broad new pattern at
     block weight. Zero-width chars are deliberately non-decisive: emoji
-    ZWJ sequences made them fire on ordinary PRs.
+    ZWJ sequences made them fire on ordinary PRs. When the triage runs on
+    a **fallback** agent (primary cooling/absent), `security.assess` leans
+    the same way: a nonzero model score or heuristic signal on a fallback
+    verdict upgrades `proceed` to `warn` (banner), never the reverse, and
+    never manufactures a block. The triage agent identity is recorded in
+    `security.json` either way.
 13. **Never let the harness's own credentials reach the agents.** tmux
     sessions inherit the *tmux server's* environment, not the launching
     process's, so a stale `ANTHROPIC_API_KEY` in a long-lived tmux server
     shadows each CLI's login and 401s the whole swarm — with the harness
-    still reporting "9 agents ran". Both `_write_runner` and `run_single`
-    unset it. If you add a third agent-launch path, unset it there too.
+    still reporting "9 agents ran". Both `_write_runner` and `_launch_single`
+    unset it. If you add another agent-launch path, unset it there too.
 14. **Never name any other repo — anywhere in this repo or its git history.**
     This codebase is public. The only repos that may appear by name are
     `sandialabs/atlas-ui-3` (the default upstream), `garland3/atlas-watcher`
