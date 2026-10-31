@@ -29,14 +29,27 @@ from .paths import cooldown_file
 # limiting. The size guard in :func:`classify_limit` and the "only failed
 # agents" rule in the swarm are what keep this from misfiring on reviewed
 # code that talks about 429s.
+# The window name is free-form because the CLIs keep renaming it: "session",
+# "usage", "5-hour", "weekly", ... Missing one turns a limit into a `failed`
+# row and burns the item's retry budget instead of pausing.
 _LIMIT_PATTERNS = (
-    r"you'?ve hit your (session|usage|rate) limit",
-    r"hit your (session|usage|rate) limit",
+    r"hit your [\w -]{0,24}limit",
     r"(session|usage) limit (reached|exceeded|hit)",
     r"rate limit (reached|exceeded|hit)",
     r"too many requests",
     r"exceeded your current quota",
     r"quota exceeded",
+    r"credit balance is too low",
+    r"(insufficient|out of) (credits?|quota|balance)",
+)
+
+# Safety net for wordings nobody has seen yet, applied only to the short
+# output of an agent that *failed* (never anchored/successful output): a
+# line naming a cap together with a when-to-retry hint. A miss costs an
+# item's retry budget; a false hit only pauses the pass and self-expires.
+_FALLBACK_CAP_RE = re.compile(r"\b(limit|quota|credits?)\b", re.IGNORECASE)
+_FALLBACK_RETRY_RE = re.compile(
+    r"\b(resets?|try again|retry after|upgrade)\b", re.IGNORECASE,
 )
 
 # A real limit message is a line or two; a genuine summary/findings file is
@@ -47,10 +60,25 @@ _LIMIT_OUTPUT_MAX = 2000
 # for a prefix like "Error: " or "Claude AI " but not for a quoted mention.
 _ANCHOR_SLACK = 16
 
-# "resets 11am (America/Denver)", "resets 3:30pm (America/Los_Angeles)",
-# "resets 17:00". The timezone is optional; absent, we assume local time.
+# When the cap lifts, as the CLIs print it:
+#   "resets 11am (America/Denver)", "resets 3:30pm", "resets 17:00",
+#   "resets Oct 27, 5pm (America/Denver)",
+#   "try again at 10:26 PM.", "try again at Oct 30th, 2026 1:34 AM."
+# The date and timezone are optional; absent a timezone, local time is used.
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun",
+           "jul", "aug", "sep", "oct", "nov", "dec")
 _RESET_RE = re.compile(
-    r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?",
+    r"(?:resets?|try again)\s+(?:at\s+)?"
+    r"(?:(?P<mon>[a-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s*"
+    r"(?:(?P<year>\d{4}),?\s*)?)?"
+    r"(?P<hour>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<ampm>am|pm)?\b\.?\s*"
+    r"(?:\((?P<tz>[^)]+)\))?",
+    re.IGNORECASE,
+)
+# "try again in 3 hours", "resets in 45 minutes".
+_RESET_IN_RE = re.compile(
+    r"(?:resets?|try again|retry)\s+in\s+(\d{1,4})\s*"
+    r"(minutes?|mins?|m|hours?|hrs?|h|days?|d)\b",
     re.IGNORECASE,
 )
 
@@ -66,7 +94,9 @@ def _line_matches(line: str, anchored: bool) -> bool:
         m = re.search(p, line, re.IGNORECASE)
         if m and (not anchored or m.start() <= _ANCHOR_SLACK):
             return True
-    return False
+    if anchored:
+        return False
+    return bool(_FALLBACK_CAP_RE.search(line) and _FALLBACK_RETRY_RE.search(line))
 
 
 def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
@@ -76,7 +106,8 @@ def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
     prefix such as "Error: "), which is how a CLI prints its own limit
     message. Use it for output from an agent that *succeeded*: such output
     can quote upstream text that mentions a limit — e.g. a triage verdict
-    citing another bot's "usage limit reached" PR comment.
+    citing another bot's "usage limit reached" PR comment. Unanchored
+    matching (failed agents only) also applies the unknown-wording fallback.
 
     Pure: never writes state. Callers decide whether to record a cooldown.
     """
@@ -89,31 +120,63 @@ def classify_limit(text: str, anchored: bool = False) -> LimitInfo | None:
     return None
 
 
-def _parse_reset(text: str) -> float | None:
-    m = _RESET_RE.search(text)
-    if not m:
-        return None
-    hour = int(m.group(1))
-    minute = int(m.group(2) or 0)
-    meridiem = (m.group(3) or "").lower()
-    tz_name = m.group(4)
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+def _parse_reset(text: str, now: datetime | None = None) -> float | None:
+    if m := _RESET_IN_RE.search(text):
+        n, unit = int(m[1]), m[2].lower()
+        secs = n * (86400 if unit.startswith("d") else
+                    3600 if unit.startswith("h") else 60)
+        return (now or datetime.now(UTC)).timestamp() + secs
+    for m in _RESET_RE.finditer(text):
+        ts = _reset_from_match(m, now)
+        if ts is not None:
+            return ts
+    return None
+
+
+def _reset_from_match(m: re.Match, now: datetime | None) -> float | None:
+    hour = int(m["hour"])
+    minute = int(m["min"] or 0)
+    meridiem = (m["ampm"] or "").lower()
+    if meridiem and not 1 <= hour <= 12:
         return None
     if meridiem == "pm" and hour != 12:
         hour += 12
     elif meridiem == "am" and hour == 12:
         hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    # No timezone → system local time. Build naive datetimes and let
+    # .astimezone() apply local rules per date, so a reset on the far side of
+    # a DST change isn't off by an hour (a fixed offset would be).
     try:
-        tz = ZoneInfo(tz_name) if tz_name else datetime.now().astimezone().tzinfo
+        tz = ZoneInfo(m["tz"]) if m["tz"] else None
     except (KeyError, ValueError):
         return None
-    if tz is None:
-        return None
-    now = datetime.now(tz)
+    now = now or datetime.now(UTC)
+    now = now.astimezone(tz) if tz else now.astimezone().replace(tzinfo=None)
+
+    if m["mon"]:
+        mon = m["mon"].lower()
+        if mon not in _MONTHS:
+            return None
+        try:
+            target = datetime(int(m["year"] or now.year), _MONTHS.index(mon) + 1,
+                              int(m["day"]), hour, minute, tzinfo=tz)
+        except ValueError:
+            return None
+        # "Jan 2, 5pm" printed in late December means next year.
+        if not m["year"] and target < now - timedelta(days=180):
+            target = target.replace(year=target.year + 1)
+        return _ts(target)
+
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
-    return target.timestamp()
+    return _ts(target)
+
+
+def _ts(dt: datetime) -> float:
+    return (dt if dt.tzinfo else dt.astimezone()).timestamp()
 
 
 def read() -> dict | None:
@@ -142,8 +205,10 @@ def record(limit: LimitInfo) -> dict:
 
     Honors the agent's stated reset time when it parses, otherwise backs off
     exponentially by consecutive limit hits (base * 2^(n-1)), capped both
-    ways. The cap matters because a mis-parsed reset must not park the watcher
-    for a day: retrying early only re-detects the limit and extends.
+    ways. The fallback cap matters because a guess must not park the watcher
+    for a day: retrying early only re-detects the limit and extends. A stated
+    reset gets the longer ``agent_limit_reset_max_secs`` ceiling, since a
+    weekly limit really does last days.
     """
     now = time.time()
     prev = read()
@@ -154,8 +219,10 @@ def record(limit: LimitInfo) -> dict:
         settings.agent_limit_backoff_secs * (2 ** (consecutive - 1)),
         settings.agent_limit_backoff_max_secs,
     )
-    until = limit.reset_ts if (limit.reset_ts and limit.reset_ts > now) else now + fallback
-    until = min(until, now + settings.agent_limit_backoff_max_secs)
+    if limit.reset_ts and limit.reset_ts > now:
+        until = min(limit.reset_ts, now + settings.agent_limit_reset_max_secs)
+    else:
+        until = min(now + fallback, now + settings.agent_limit_backoff_max_secs)
     state = {
         "until_ts": until,
         "set_at": now,

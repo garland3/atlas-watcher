@@ -171,11 +171,17 @@ def _session_alive(session: str) -> bool:
     ).returncode == 0
 
 
+# Marker in the placeholder the harness writes for an agent that produced
+# nothing. Keyed on this, not on NO_FINDINGS: a bare NO_FINDINGS is a real
+# result ("nothing to flag") that a resumed swarm must not re-run.
+_STUB_MARKER = "agent did not write findings file"
+
+
 def _is_stub(path: Path) -> bool:
     """True if a findings file is the placeholder the harness writes when an
     agent produced nothing (as opposed to real findings)."""
     try:
-        return "NO_FINDINGS" in path.read_text(encoding="utf-8", errors="ignore")
+        return _STUB_MARKER in path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return True
 
@@ -311,7 +317,7 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
     for p, _, _, _, findings_path, *_ in pending:
         if not findings_path.is_file() or findings_path.stat().st_size == 0:
             findings_path.write_text(
-                f"<!-- {p.name}: agent did not write findings file. "
+                f"<!-- {p.name}: {_STUB_MARKER}. "
                 f"See .logs/{p.name}.stdout.log and .logs/{p.name}.stderr.log -->\n"
                 "NO_FINDINGS\n",
                 encoding="utf-8",
@@ -332,6 +338,15 @@ def run_swarm(repo: str, pr_number: int, checkout: Path,
             raise AgentLimitError(
                 f"{p.name} hit an agent limit: {limit.reason}", limit.reset_ts,
             )
+
+    # Not one agent finished cleanly: whatever happened (auth, network, a CLI
+    # change), the manager would only summarize stubs. Fail here with the
+    # real cause instead of a misleading "manager did not produce summary".
+    if not any(_agent_completed(pl[3], pl[4]) for pl in plans):
+        raise RuntimeError(
+            f"swarm: all {len(plans)} agents failed without findings; "
+            f"see {logs_dir}"
+        )
 
     log("swarm complete")
 

@@ -5,6 +5,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
+from . import cooldown
 from .config import settings
 from .paths import issue_dir, ledger_file, pr_dir
 
@@ -79,6 +80,13 @@ def has_done(repo: str, kind: Kind, number: int, key: str) -> bool:
 
 
 def _failed_rows(repo: str, kind: Kind, number: int, key: str) -> list[dict]:
+    """Failed attempts that count against the retry budget.
+
+    A ``failed`` row whose transcripts show an agent limit is excluded: it
+    should have been ``deferred``, and was only recorded as a failure because
+    the detector didn't know that wording yet. Excluding it here means a
+    detector fix un-sticks those items on the next pass with no ledger edit.
+    """
     default_repo = settings.repos[0] if settings.repos else None
     return [
         rec for rec in _iter_rows()
@@ -87,6 +95,7 @@ def _failed_rows(repo: str, kind: Kind, number: int, key: str) -> list[dict]:
         and rec.get("key") == key
         and rec.get("status") == "failed"
         and _repo_matches(rec, repo, default_repo)
+        and not _failure_was_limit(rec)
     ]
 
 
@@ -177,10 +186,45 @@ def _has_terminal_evidence(rec: dict) -> bool:
     return True
 
 
-def reconcile() -> tuple[int, int]:
-    """Drop ``done`` rows that have no posted.json evidence on disk.
+def _item_dir(rec: dict):
+    repo = rec.get("repo") or (settings.repos[0] if settings.repos else "")
+    kind = rec.get("kind")
+    if not repo or kind not in ("pr", "issue"):
+        return None
+    number, key = int(rec.get("number")), str(rec.get("key", ""))
+    return pr_dir(repo, number, key) if kind == "pr" else issue_dir(repo, number, key)
 
-    Returns ``(kept_count, dropped_count)``. Non-done rows and malformed
+
+def _failure_was_limit(rec: dict) -> bool:
+    """True if a ``failed`` row was really an agent rate/session limit.
+
+    Happens when a CLI words its limit message in a way the detector did not
+    yet know, so the run failed downstream (e.g. "manager did not produce
+    summary.md") instead of deferring. The agent transcripts are overwritten
+    on each attempt, so they describe the most recent one. Matching is
+    anchored: a real CLI limit message opens its line.
+    """
+    base = _item_dir(rec)
+    if base is None or not base.is_dir():
+        return False
+    logs = [*base.glob("*.log"), *base.glob("*.raw.txt"),
+            *base.glob("perspectives/.logs/*.log")]
+    for path in logs:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if cooldown.classify_limit(text, anchored=True):
+            return True
+    return False
+
+
+def reconcile() -> tuple[int, int]:
+    """Drop ``done`` rows that have no posted.json evidence on disk, and
+    ``failed`` rows whose transcripts show an agent limit (those should
+    have been ``deferred`` and must not count against the retry budget).
+
+    Returns ``(kept_count, dropped_count)``. Other rows and malformed
     lines are kept untouched. The ledger file is rewritten in place.
     """
     if not ledger_file().is_file():
@@ -198,6 +242,9 @@ def reconcile() -> tuple[int, int]:
             continue
         if (rec.get("status") in _TERMINAL_STATUSES
                 and not _has_terminal_evidence(rec)):
+            dropped += 1
+            continue
+        if rec.get("status") == "failed" and _failure_was_limit(rec):
             dropped += 1
             continue
         kept.append(line)

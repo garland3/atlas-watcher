@@ -391,6 +391,8 @@ Everything tunable lives in `config.env`. Override locally with
   cooldown set when an agent reports a rate/session limit. The agent's
   stated reset time is honored when it parses; otherwise the pause backs
   off exponentially, capped at the max. Defaults 3600 / 21600.
+- `AGENT_LIMIT_RESET_MAX_SECS` — ceiling on a reset time the agent stated
+  (e.g. `resets Oct 27, 5pm` for a weekly limit). Default 691200 (8 days).
 - `SECURITY_BLOCK_ABOVE`, `SECURITY_WARN_ABOVE` — risk tiers (`low`,
   `medium`, `high`, `critical`) that gate the swarm. Defaults: block at
   `high`, warn at `medium`. Set both to `critical` to disable.

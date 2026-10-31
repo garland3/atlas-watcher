@@ -185,10 +185,13 @@ def config() -> None:
 
 @app.command("reconcile-ledger")
 def reconcile_ledger() -> None:
-    """Drop ``done`` rows that have no posted.json on disk.
+    """Drop ``done`` rows that have no posted.json on disk, and ``failed``
+    rows that were really agent limits.
 
     Useful after dry-runs or partial runs left the ledger thinking work
-    was finished when it wasn't actually posted upstream.
+    was finished when it wasn't actually posted upstream, or after a limit
+    message the detector missed burned an item's retry budget.
     """
     kept, dropped = ledger_mod.reconcile()
-    typer.echo(f"kept {kept} rows; dropped {dropped} rows lacking posted.json")
+    typer.echo(f"kept {kept} rows; dropped {dropped} rows lacking posted.json "
+               "or misrecorded agent limits")

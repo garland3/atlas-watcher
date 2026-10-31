@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     # tight retry loop while the account is capped.
     agent_limit_backoff_secs: int = 3600
     agent_limit_backoff_max_secs: int = 21_600
+    # Ceiling on a reset time the agent *stated* (and we parsed). Longer than
+    # the backoff cap so a weekly limit is waited out in one pause instead of
+    # relaunching a doomed swarm every few hours.
+    agent_limit_reset_max_secs: int = 691_200
 
     # Per-item retry backoff. An item that failed is not retried until
     # base * 2^(failures-1) seconds have elapsed, capped. Failure kinds that
