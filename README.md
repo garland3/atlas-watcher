@@ -109,11 +109,20 @@ header of that file for every knob. Notable ones:
 - `BOT_NAME` — comment-body signature.
 - `DCLAUDE_CMD`, `CODEX_CMD`, `CLINE_CMD`, `OPENCODE_CMD` — agent CLI
   commands.
-- `MANAGER_AGENT` — CLI that runs the manager/orchestrator (`dclaude`,
-  `codex`, `cline`, `opencode`, or any name registered in `AGENT_COMMANDS`).
-  The tracked default is `dclaude` (Claude CLI).
-- `AGENT_COMMANDS` — optional JSON map of extra agent names to commands, so
-  a new CLI can become the orchestrator without a code change.
+- `PERSPECTIVE_AGENTS`, `GENERIC_A_AGENTS`, `GENERIC_B_AGENTS`,
+  `MANAGER_AGENTS`, `SECURITY_TRIAGE_AGENTS`, `ISSUE_TRIAGE_AGENTS` —
+  ordered fallback lists per role. The first candidate whose binary exists
+  and whose vendor is not cooling down runs the role; rate limits, auth
+  errors and missing binaries fail over to the next candidate (ordinary
+  failures never do). `MANAGER_AGENTS` supersedes `MANAGER_AGENT`.
+- `MIN_SWARM_VENDORS` — a review must draw on findings from at least this
+  many distinct vendors before the manager runs; a swarm that cannot reach
+  the minimum is deferred rather than posted as a single-vendor review.
+- `MANAGER_AGENT` — legacy single setting for the manager CLI; superseded by
+  `MANAGER_AGENTS` and still honored when that is unset.
+- `AGENT_COMMANDS` — optional JSON map of extra agent names to commands (a
+  string, or an object with `command` and an optional `vendor`), so a new
+  CLI can fill any role without a code change.
 - `AGENT_TIMEOUT_SECS` — per-agent wall-clock cap (default 1800s).
 - `POLL_INTERVAL_SECS` — sleep between passes in `loop` mode (default 900s
   / 15 min, matching the cron cadence).

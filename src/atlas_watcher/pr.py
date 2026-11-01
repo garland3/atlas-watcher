@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import audit, gh, git, ledger, security, swarm
+from . import agents, audit, gh, git, ledger, security, swarm
 from .config import settings
 from .log import log
 from .paths import PROMPTS, pr_dir, repo_workdir
 from .post import post_pr_comment
 from .scrub import scrub_identity
+
+_merge_ran = audit.merge_ran
 
 
 def _format_comments(comments: list | None) -> str:
@@ -70,31 +72,38 @@ def _run_manager(repo: str, sha_dir: Path, review_round: int) -> Path:
     )
     full_prompt = f"{base_prompt}\n\n---\n\n{runtime}\n"
 
-    log_path = sha_dir / "manager.log"
-    agent = settings.manager_agent
-    log(f"manager agent: {agent}")
-    rc = swarm.run_single(
-        agent, full_prompt,
+    log(f"manager role candidates: "
+        f"{', '.join(agents.role_candidates('manager'))}")
+    result = swarm.run_role(
+        "manager", full_prompt,
         out_file=sha_dir / "manager.stdout.log",
-        log_file=log_path,
+        log_file=sha_dir / "manager.log",
         # The manager only reads PERSPECTIVES_DIR and writes SUMMARY_PATH, both
         # absolute. It is deliberately NOT given the audit repo as its cwd —
         # publishing is the harness's job (audit.sync), so an agent that has
         # just ingested untrusted upstream text never has a git remote in reach.
         cwd=sha_dir,
+        raise_on_failure=False,
     )
-    log(f"manager rc={rc}")
+    log(f"manager agent={result.agent} rc={result.rc}")
 
     if not summary_path.is_file() or summary_path.stat().st_size == 0:
         raise RuntimeError(
-            f"manager ({agent}) did not produce {summary_path}; see {log_path}"
+            f"manager ({result.agent}) did not produce {summary_path}; "
+            f"see {sha_dir / _manager_log(result.agent)}"
         )
 
     summary_path.write_text(
         scrub_identity(summary_path.read_text(encoding="utf-8")),
         encoding="utf-8",
     )
+    _merge_ran(sha_dir, "manager",
+               {"agent": result.agent, "vendor": result.vendor})
     return summary_path
+
+
+def _manager_log(agent: str) -> str:
+    return f"manager.{agent}.log"
 
 
 def _generate_review(repo: str, meta: dict, sha_dir: Path) -> Path:
@@ -110,7 +119,10 @@ def _generate_review(repo: str, meta: dict, sha_dir: Path) -> Path:
     workdir = repo_workdir(repo)
     git.checkout_pr(repo, workdir, meta["number"], meta["baseRefName"])
     ctx_path = _build_context(repo, meta, workdir, meta["baseRefName"], sha_dir)
-    swarm.run_swarm(repo, meta["number"], workdir, sha_dir, ctx_path)
+    record = swarm.run_swarm(repo, meta["number"], workdir, sha_dir, ctx_path)
+    _merge_ran(sha_dir, "perspectives", record)
+    _merge_ran(sha_dir, "vendors",
+               sorted(swarm.record_vendors(record)))
     return _run_manager(repo, sha_dir, review_round)
 
 
@@ -155,10 +167,13 @@ def process(repo: str, pr_number: int, dry_run: bool = False) -> str:
         return _process(repo, meta, dry_run)
     except Exception as e:
         if not dry_run:
-            # A rate/session limit is account-wide: record it as "deferred"
-            # so it neither counts against the retry budget nor is mistaken
-            # for a defect in this PR. The cooldown gates the next attempt.
-            status = "deferred" if isinstance(e, swarm.AgentLimitError) else "failed"
+            # A rate/session limit (or a vendor-diversity shortfall) is
+            # infrastructure, not a defect in this PR: record it as
+            # "deferred" so it neither counts against the retry budget nor
+            # reads as a failure of the item. The per-vendor cooldown gates
+            # the next attempt.
+            status = ("deferred" if isinstance(e, swarm.DEFERRED_ERRORS)
+                      else "failed")
             try:
                 ledger.append(repo, "pr", pr_number, sha, status=status,
                               error=repr(e)[:500])
@@ -197,6 +212,14 @@ def _process(repo: str, meta: dict, dry_run: bool) -> str:
     else:
         summary_path = _generate_review(repo, meta, sha_dir)
 
+    # Record which agent/vendor produced the security verdict (works for a
+    # cached verdict too — the agent identity travels in security.json).
+    _merge_ran(sha_dir, "security_triage", {
+        "agent": verdict["model_verdict"].get("agent"),
+        "vendor": verdict["model_verdict"].get("vendor"),
+        "fallback": verdict["model_verdict"].get("agent_fallback", False),
+    })
+
     # Step 2: if the verdict was 'warn', prepend a neutral banner before
     # posting (kept out of summary.md so re-posting doesn't double-stack).
     post_path = summary_path
@@ -221,6 +244,9 @@ def _process(repo: str, meta: dict, dry_run: bool) -> str:
     )
     log(f"posted: {url}")
 
-    ledger.append(repo, "pr", pr_number, sha)
+    # The ledger row carries the vendor list that actually produced the
+    # review, so weak failover reviews are visible in the audit log.
+    vendors = sorted(swarm.record_vendors(swarm.read_agent_record(sha_dir)))
+    ledger.append(repo, "pr", pr_number, sha, vendors=vendors)
     audit.sync(message=f"finalize {repo} PR #{pr_number} @ {sha[:12]}")
     return "done"

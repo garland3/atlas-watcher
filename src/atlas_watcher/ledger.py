@@ -17,8 +17,14 @@ def _now() -> str:
 
 
 def append(repo: str, kind: Kind, number: int, key: str,
-           status: str = "done", error: str | None = None) -> None:
-    """Append one record. Caller is responsible for idempotency check."""
+           status: str = "done", error: str | None = None,
+           vendors: list[str] | None = None) -> None:
+    """Append one record. Caller is responsible for idempotency check.
+
+    ``vendors`` records the vendors that actually produced the review (see
+    ``agents.json`` / metadata.json ``ran``), so a weak failover review is
+    visible in the audit log without opening the review folder.
+    """
     ledger_file().parent.mkdir(parents=True, exist_ok=True)
     record = {
         "ts": _now(),
@@ -30,6 +36,8 @@ def append(repo: str, kind: Kind, number: int, key: str,
     }
     if error is not None:
         record["error"] = error
+    if vendors:
+        record["vendors"] = sorted(set(vendors))
     with ledger_file().open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, separators=(",", ":")) + "\n")
 

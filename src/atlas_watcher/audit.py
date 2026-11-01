@@ -7,6 +7,7 @@ operates on that repo, never on the code repo.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,9 +23,10 @@ from .paths import data_root
 # disk for debugging; they are not committed.
 DATA_GITIGNORE = """\
 # Runtime debris — kept on disk for debugging, never committed.
-# The durable record is metadata.json, context.md, diff.patch,
-# perspectives/*.md, security.{json,md}, summary.md, analysis.md,
-# comment.md, posted.json, blocked.json and the ledger.
+# The durable record is metadata.json (including its "ran" section naming
+# the agent/vendor behind each perspective), agents.json, context.md,
+# diff.patch, perspectives/*.md, security.{json,md}, summary.md,
+# analysis.md, comment.md, posted.json, blocked.json and the ledger.
 **/perspectives/.logs/
 **/perspectives/.runners/
 **/perspectives/.sentinels/
@@ -57,6 +59,26 @@ def _git(*args: str, check: bool = True,
         ["git", "-C", str(cwd or data_root()), *args],
         check=check, capture_output=True, text=True,
     )
+
+
+def merge_ran(item_dir: Path, key: str, value) -> None:
+    """Record in an item's metadata.json which agent/vendor produced what.
+
+    The ``ran`` section names the agent and vendor behind each perspective,
+    the manager summary and the security verdict (per issue #1), so a weak
+    failover review is traceable in the audit repo. This file is
+    audit-record-only: everything POSTED upstream still passes the identity
+    scrub, which never sees this file.
+    """
+    path = item_dir / "metadata.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("ran", {})[key] = value
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def is_initialized() -> bool:
