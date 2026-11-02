@@ -15,7 +15,7 @@ def test_role_lists_default_to_the_legacy_single_agents():
     s = _settings()
     assert s.perspective_agents == ["dclaude"]
     assert s.generic_a_agents == ["codex"]
-    assert s.generic_b_agents == ["cline"]
+    assert s.generic_b_agents == ["opencode"]
     assert s.security_triage_agents == ["dclaude"]
     assert s.issue_triage_agents == ["dclaude"]
     # manager_agents empty -> falls back to the legacy MANAGER_AGENT

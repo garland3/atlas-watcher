@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     # that breaks one model must not burn every other vendor's quota in turn.
     perspective_agents: Annotated[list[str], NoDecode] = ["dclaude"]
     generic_a_agents: Annotated[list[str], NoDecode] = ["codex"]
-    generic_b_agents: Annotated[list[str], NoDecode] = ["cline"]
+    generic_b_agents: Annotated[list[str], NoDecode] = ["opencode"]
     manager_agents: Annotated[list[str], NoDecode] = []  # empty -> [manager_agent]
     security_triage_agents: Annotated[list[str], NoDecode] = ["dclaude"]
     issue_triage_agents: Annotated[list[str], NoDecode] = ["dclaude"]

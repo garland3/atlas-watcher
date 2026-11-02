@@ -193,7 +193,7 @@ atlas-watcher/
 │   ├── perspective-5-performance.md
 │   ├── perspective-6-ux.md
 │   ├── perspective-7-evidence.md   # sufficiency-of-evidence score (1–10)
-│   ├── generic-review.md           # used by codex and cline
+│   ├── generic-review.md           # used by both generic reviewers
 │   ├── manager.md                  # manager agent: synthesize summary.md
 │   └── issue-triage.md             # issue analysis + clarification prompt
 ├── workdir/<owner>/<name>/        # ONE persistent clone per upstream repo
@@ -421,7 +421,7 @@ Everything tunable lives in `config.env`. Override locally with
 - `PERSPECTIVE_AGENTS`, `GENERIC_A_AGENTS`, `GENERIC_B_AGENTS`,
   `SECURITY_TRIAGE_AGENTS`, `ISSUE_TRIAGE_AGENTS` — the same idea for the
   other roles: ordered fallback lists. Defaults are the legacy single
-  agents (`dclaude` / `codex` / `cline`).
+  agents (`dclaude` / `codex` / `opencode`).
 - `MIN_SWARM_VENDORS` — minimum distinct vendors that must produce real
   findings before the manager runs; below it the item is deferred instead
   of posted. Default 2. Set to 1 to restore single-vendor posting.
@@ -492,7 +492,7 @@ there (with a default) before referencing them.
    `prompts/*.md` together.
 4. **Keep specific-perspective prompts strictly scoped.** Cross-cutting
    findings are the synthesizer's job, not any single specialist's. The
-   generic reviewers (codex, cline) are explicitly exempt — they should
+   generic reviewers (generic-a, generic-b) are explicitly exempt — they should
    flag anything they find. The **evidence** reviewer is scoped too, but
    to a different axis: it judges *sufficiency of demonstration* (does the
    PR prove it works, proportionate to its size?), not code defects, and
