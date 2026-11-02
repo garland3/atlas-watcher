@@ -123,6 +123,9 @@ header of that file for every knob. Notable ones:
 - `AGENT_COMMANDS` — optional JSON map of extra agent names to commands (a
   string, or an object with `command` and an optional `vendor`), so a new
   CLI can fill any role without a code change.
+- `SECURITY_EXEMPT_REPOS` — globs (e.g. `myorg/*`) for trusted repos that
+  skip the prompt-injection security triage. Empty by default: triage runs
+  on every repo.
 - `AGENT_TIMEOUT_SECS` — per-agent wall-clock cap (default 1800s).
 - `POLL_INTERVAL_SECS` — sleep between passes in `loop` mode (default 900s
   / 15 min, matching the cron cadence).

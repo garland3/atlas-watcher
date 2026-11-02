@@ -464,6 +464,13 @@ Everything tunable lives in `config.env`. Override locally with
   `security.json`.
 - `SECURITY_TIMEOUT_SECS` — wall-clock cap for the security triage
   agent. Default 600.
+- `SECURITY_EXEMPT_REPOS` — comma-separated globs over `owner/name`
+  (e.g. `myorg/*`) whose PRs/issues skip security triage entirely: no
+  agent, no heuristics, no banner, never blocked. Empty by default, so
+  triage runs everywhere. A `security.json` marked `"exempt": true` is still
+  written for the audit trail, and is ignored (re-assessed) once the
+  exemption is lifted. Exempt only repos whose every author you trust, and
+  list them in `config.local.env` only (rule 14).
 - `AGENT_INHERIT_API_KEY` — default false. Each generated runner does
   `unset ANTHROPIC_API_KEY anthropic_key` so agents use their own CLI
   login. See rule 13 below.

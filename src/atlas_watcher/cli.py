@@ -53,6 +53,17 @@ def issue(
     issue_mod.process(_resolve_repo(repo), number, dry_run=dry_run)
 
 
+def _item_roles(repo: str, roles: tuple[str, ...]) -> tuple[str, ...]:
+    """The roles an item on ``repo`` actually needs.
+
+    A SECURITY_EXEMPT_REPOS repo never runs security triage, so a cooling
+    triage vendor must not hold its items back.
+    """
+    if settings.security_exempt(repo):
+        return tuple(r for r in roles if r != "security-triage")
+    return roles
+
+
 def _scan_repo(repo: str, dry_run: bool) -> None:
     log(f"scan: {repo}")
     try:
@@ -63,7 +74,8 @@ def _scan_repo(repo: str, dry_run: bool) -> None:
     for n in prs:
         if _blocked_pass():
             return
-        if _skip_item(repo, f"PR #{n}", agents.PR_ROLES):
+        if _skip_item(repo, f"PR #{n}",
+                      _item_roles(repo, agents.PR_ROLES)):
             continue
         try:
             pr_mod.process(repo, n, dry_run=dry_run)
@@ -78,7 +90,8 @@ def _scan_repo(repo: str, dry_run: bool) -> None:
     for n in issues:
         if _blocked_pass():
             return
-        if _skip_item(repo, f"issue #{n}", agents.ISSUE_ROLES):
+        if _skip_item(repo, f"issue #{n}",
+                      _item_roles(repo, agents.ISSUE_ROLES)):
             continue
         try:
             issue_mod.process(repo, n, dry_run=dry_run)

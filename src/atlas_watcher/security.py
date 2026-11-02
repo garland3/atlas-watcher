@@ -338,12 +338,19 @@ def assess(repo: str, kind: str, number: int, text: str,
     already exists, returns it without re-running the agent.
     """
     snap_dir.mkdir(parents=True, exist_ok=True)
+    if settings.security_exempt(repo):
+        return _exempt_verdict(repo, kind, number, snap_dir)
     cache = snap_dir / "security.json"
     if cache.is_file() and cache.stat().st_size > 0:
         try:
-            return json.loads(cache.read_text(encoding="utf-8"))
+            cached = json.loads(cache.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             log(f"security: cached {cache} is malformed; reassessing")
+        else:
+            # A verdict cached while the repo was exempt is not an
+            # assessment; once the exemption is lifted, really assess.
+            if not cached.get("exempt"):
+                return cached
 
     heur = _heuristic_verdict(text)
     model = _run_model_verdict(text, snap_dir)
@@ -407,6 +414,43 @@ def assess(repo: str, kind: str, number: int, text: str,
     cache.write_text(json.dumps(verdict, indent=2), encoding="utf-8")
     _write_human_readable(snap_dir, verdict)
     log(f"security: {kind} #{number} → risk={final_risk} score={final_score} decision={decision}")
+    return verdict
+
+
+def _exempt_verdict(repo: str, kind: str, number: int,
+                    snap_dir: Path) -> dict[str, Any]:
+    """A ``proceed`` verdict for a SECURITY_EXEMPT_REPOS repo; nothing runs.
+
+    Still written to security.json/security.md so the audit record shows the
+    item was deliberately not triaged rather than silently missing a verdict.
+    """
+    verdict = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "repo": repo,
+        "kind": kind,
+        "number": number,
+        "exempt": True,
+        "final_risk": "low",
+        "final_score": 0,
+        "decision": "proceed",
+        "block_downgraded_to_warn": False,
+        "fallback_upgraded_to_warn": False,
+        "model_verdict": {"risk": "low", "score": 0, "categories": [],
+                          "reasons": ["repo is in SECURITY_EXEMPT_REPOS"]},
+        "heuristic_verdict": {"score": 0, "signals": []},
+        "thresholds": {
+            "block_above": settings.security_block_above,
+            "warn_above": settings.security_warn_above,
+        },
+    }
+    (snap_dir / "security.json").write_text(json.dumps(verdict, indent=2),
+                                            encoding="utf-8")
+    (snap_dir / "security.md").write_text(
+        f"# Security triage — {kind} #{number}\n\n"
+        "- **Decision:** `proceed` — **skipped**: this repo is listed in "
+        "SECURITY_EXEMPT_REPOS, so no triage agent or heuristic ran.\n",
+        encoding="utf-8")
+    log(f"security: {kind} #{number} skipped — {repo} is security-exempt")
     return verdict
 
 

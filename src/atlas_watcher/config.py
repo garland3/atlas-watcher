@@ -1,6 +1,7 @@
 """Settings loaded from config.env (and optional config.local.env override)."""
 from __future__ import annotations
 
+import fnmatch
 from typing import Annotated
 
 from pydantic import BaseModel, field_validator, model_validator
@@ -180,7 +181,15 @@ class Settings(BaseSettings):
     # behaviour.
     security_require_corroboration: bool = True
 
-    @field_validator("repos", mode="before")
+    # Repos whose PRs/issues skip security triage entirely (no agent, no
+    # heuristics, no banner, never blocked). Comma-separated fnmatch globs
+    # over "owner/name", e.g. "myorg/*". Empty (the default) means triage
+    # runs on every repo. Only exempt repos whose authors you trust — e.g.
+    # private repos where every contributor is you. List them in
+    # config.local.env, never config.env (editing rule 14).
+    security_exempt_repos: Annotated[list[str], NoDecode] = []
+
+    @field_validator("repos", "security_exempt_repos", mode="before")
     @classmethod
     def _parse_repos(cls, v):
         if isinstance(v, str):
@@ -261,6 +270,11 @@ class Settings(BaseSettings):
                 f"lower MIN_SWARM_VENDORS"
             )
         return self
+
+    def security_exempt(self, repo: str) -> bool:
+        """True if ``repo`` matches a SECURITY_EXEMPT_REPOS glob."""
+        return any(fnmatch.fnmatchcase(repo.lower(), pat.lower())
+                   for pat in self.security_exempt_repos)
 
     @property
     def default_repo(self) -> str:

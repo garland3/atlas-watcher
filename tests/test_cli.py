@@ -66,3 +66,20 @@ def test_item_not_skipped_for_a_missing_binary(
     # run and fail loudly, so the misconfiguration surfaces in the ledger.
     _configure(patch_settings, fake_binaries, missing={"cline"})
     assert cli._skip_item("o/r", "PR #1", cli.agents.PR_ROLES) is False
+
+
+def test_exempt_repo_item_not_held_back_by_cooling_triage(
+        patch_settings, fake_binaries, cooldown_file):
+    # Only security triage's vendor is cooling: an exempt repo never runs
+    # triage, so its items must not be skipped; other repos' items are.
+    _configure(patch_settings, fake_binaries)
+    patch_settings(generic_b_agents=["codex"],
+                   security_triage_agents=["cline"],
+                   security_exempt_repos=["myorg/*"])
+    cooldown.record("cline", cooldown.LimitInfo("usage limit reached",
+                                                 time.time() + 3600))
+    from atlas_watcher import agents
+    assert cli._skip_item("myorg/r", "PR #1",
+                          cli._item_roles("myorg/r", agents.PR_ROLES)) is False
+    assert cli._skip_item("other/r", "PR #1",
+                          cli._item_roles("other/r", agents.PR_ROLES)) is True

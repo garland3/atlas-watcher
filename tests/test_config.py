@@ -65,3 +65,14 @@ def test_unknown_agent_in_a_role_list_is_rejected():
 def test_min_swarm_vendors_must_be_positive():
     with pytest.raises(ValidationError, match="MIN_SWARM_VENDORS"):
         _settings(min_swarm_vendors=0)
+
+
+def test_security_exempt_repos_default_empty_and_parse_globs():
+    assert _settings().security_exempt_repos == []
+    assert not _settings().security_exempt("sandialabs/atlas-ui-3")
+    s = _settings(security_exempt_repos="myorg/*, other/one")
+    assert s.security_exempt_repos == ["myorg/*", "other/one"]
+    assert s.security_exempt("MyOrg/anything")
+    assert s.security_exempt("other/one")
+    assert not s.security_exempt("other/two")
+    assert _settings(security_exempt_repos="").security_exempt_repos == []
