@@ -25,7 +25,9 @@ def triage_agent(monkeypatch):
     return install
 
 
-def test_proceed_when_primary_triage_is_clean(tmp_path, triage_agent):
+def test_proceed_when_primary_triage_is_clean(tmp_path, triage_agent,
+                                              patch_settings):
+    patch_settings(security_triage_agents=["dclaude", "codex"])
     triage_agent(CLEAN)
     verdict = security.assess("sandialabs/atlas-ui-3", "pr", 1,
                               "a small refactor", tmp_path)

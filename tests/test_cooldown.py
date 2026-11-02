@@ -162,3 +162,13 @@ def test_unknown_wording_fallback_on_failed_output():
     info = cooldown.classify_limit(text, anchored=False)
     assert info is not None
     assert cooldown.classify_limit(text, anchored=True) is None
+
+
+def test_openrouter_credit_exhaustion_is_a_limit():
+    # A spent OpenRouter key is account-wide: it must pause the vendor, not
+    # burn every item's retry budget as an ordinary failure.
+    text = ("\x1b[0m\n> build · openrouter/auto\n\x1b[91m\x1b[1mError: \x1b[0m"
+            "This request requires more credits, or fewer max_tokens. You "
+            "requested up to 256000 tokens, but can only afford 3403.")
+    info = cooldown.classify_limit(text)
+    assert info is not None and info.strong is True

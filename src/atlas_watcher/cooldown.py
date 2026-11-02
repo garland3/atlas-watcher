@@ -60,6 +60,10 @@ _LIMIT_PATTERNS = (
     r"quota exceeded",
     r"credit balance is too low",
     r"(insufficient|out of) (credits?|quota|balance)",
+    # OpenRouter, once the key's credit is spent: "This request requires
+    # more credits, or fewer max_tokens. ... can only afford 3403."
+    r"requires more credits",
+    r"can only afford \d+",
 )
 
 # Safety net for wordings nobody has seen yet, applied only to the short
