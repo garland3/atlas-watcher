@@ -390,3 +390,10 @@ def test_diversity_rerun_failure_restores_original_findings(
     saved = json.loads((sha_dir / "agents.json").read_text(encoding="utf-8"))
     assert saved["generic-b"] == {"agent": "dclaude", "vendor": "anthropic"}
     assert "stub" not in saved["generic-b"]
+
+
+def test_opencode_missing_provider_credentials_is_an_auth_failure(tmp_path):
+    log = tmp_path / "manager.opencode.log"
+    log.write_text("Error: Model unavailable: openrouter/openrouter/auto\n",
+                   encoding="utf-8")
+    assert swarm._auth_from_logs(log) is True

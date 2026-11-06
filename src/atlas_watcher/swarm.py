@@ -91,6 +91,9 @@ _AUTH_PATTERNS = (
     r"\bnot (logged in|authenticated)\b",
     r"\bplease (run )?/?log ?in\b",
     r"\blogin required\b",
+    # opencode when the provider has no credentials in this environment
+    # (e.g. OPENROUTER_API_KEY only exported in an interactive shell's rc).
+    r"\bmodel unavailable:",
 )
 _AUTH_RE = re.compile("|".join(_AUTH_PATTERNS), re.IGNORECASE)
 
