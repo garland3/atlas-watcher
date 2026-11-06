@@ -88,7 +88,17 @@ class Settings(BaseSettings):
     cline_cmd: str = "cline --auto-approve true"
     # OpenCode reads the prompt from stdin. The model id is provider/model,
     # so OpenRouter's Auto Router is "openrouter/openrouter/auto".
-    opencode_cmd: str = "opencode run --model openrouter/openrouter/auto --auto"
+    # --standalone runs a private server per invocation: without it `opencode
+    # run` attaches to the background service, which ignores this process's
+    # OPENCODE_CONFIG_CONTENT (below).
+    opencode_cmd: str = (
+        "opencode run --standalone --model openrouter/openrouter/auto --auto"
+    )
+    # Exported as OPENCODE_CONFIG_CONTENT into every agent launch (merged over
+    # the operator's own opencode config). The default denies the subagent
+    # ("task") tool: reviewers spawning their own sub-agents re-read the same
+    # PR context and were ~30% of all opencode tokens. Empty disables it.
+    opencode_config_content: str = '{"permission":{"task":"deny"}}'
 
     # Extra agent commands as a JSON object, e.g.
     #   AGENT_COMMANDS={"gemini": "gemini --approval-mode yolo"}

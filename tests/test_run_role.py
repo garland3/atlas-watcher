@@ -119,3 +119,37 @@ def test_unsetting_the_harness_api_key(agents_env, patch_settings,
                             log_file=agents_env / "triage.log")
     assert result.agent == "probe"
     assert "key-clean" in (agents_env / "out.txt").read_text()
+
+
+def test_opencode_config_override_reaches_the_agent(agents_env,
+                                                    patch_settings):
+    # The subagent deny reaches opencode through OPENCODE_CONFIG_CONTENT; the
+    # fake agent reports what it saw.
+    probe = _write_agent(agents_env / "probe.sh",
+                         "cat >/dev/null\n"
+                         'printf "%s" "${OPENCODE_CONFIG_CONTENT:-unset}"\n'
+                         "exit 0\n")
+    patch_settings(agent_commands={"probe": {"command": probe,
+                                             "vendor": "xai"}},
+                   security_triage_agents=["probe"])
+    swarm.run_role("security-triage", "prompt",
+                   out_file=agents_env / "out.txt",
+                   log_file=agents_env / "triage.log")
+    assert (agents_env / "out.txt").read_text() == \
+        '{"permission":{"task":"deny"}}'
+
+
+def test_runner_script_exports_the_opencode_config(tmp_path, patch_settings):
+    patch_settings()
+    runner = tmp_path / "r.sh"
+    swarm._write_runner(runner, checkout=tmp_path, agent_cmd="true",
+                        prompt=tmp_path / "p", stdout_log=tmp_path / "o",
+                        stderr_log=tmp_path / "e", done=tmp_path / "d")
+    text = runner.read_text()
+    assert "export OPENCODE_CONFIG_CONTENT=" in text
+    assert "unset ANTHROPIC_API_KEY" in text
+    patch_settings(opencode_config_content="")
+    swarm._write_runner(runner, checkout=tmp_path, agent_cmd="true",
+                        prompt=tmp_path / "p", stdout_log=tmp_path / "o",
+                        stderr_log=tmp_path / "e", done=tmp_path / "d")
+    assert "OPENCODE_CONFIG_CONTENT" not in runner.read_text()

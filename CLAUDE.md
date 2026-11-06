@@ -120,7 +120,8 @@ output from a single neutral review bot. They must **never**:
 
 - Mention or hint at the underlying model, vendor, or tool: `claude`,
   `anthropic`, `codex`, `openai`, `gpt`, `chatgpt`, `cline`, `opencode`,
-  `openrouter`, `grok`, `xai`, `llm`, `language model`, `as an ai`,
+  `openrouter`, `grok`, `xai`, `deepseek`, `glm`, `zhipu`, `llm`,
+  `language model`, `as an ai`,
   `i am an ai`, etc.
 - Refer to "the perspectives", "the swarm", "the reviewers", or the
   pipeline. Each comment is one voice.
@@ -151,8 +152,11 @@ One asymmetry to keep in mind: `grok` is an ordinary English verb and
 `XAI` a standard ML abbreviation, so the *scrubber* only neutralizes
 identity-shaped forms (`grok-4.7`, `x.ai`, `x-ai`) while
 `prompts/identity.md` forbids the bare words at the source. A missed bare
-mention costs less than a mangled review. Keep that split when adding the
-next vendor whose name doubles as an English word.
+mention costs less than a mangled review. `glm` (also the statistics term,
+generalized linear model) gets the same split: `glm-5.3`, `z-ai` and `z.ai`
+are scrubbed, the bare word is not. `deepseek` and `zhipu` are unambiguous
+and scrubbed outright. Keep that split when adding the next vendor whose
+name doubles as an ordinary word.
 
 ---
 
@@ -428,14 +432,22 @@ Everything tunable lives in `config.env`. Override locally with
 - `DCLAUDE_CMD`, `CODEX_CMD`, `CLINE_CMD`, `OPENCODE_CMD` — the agent CLIs.
   Override if your binary names differ. `dclaude` defaults to
   `claude --dangerously-skip-permissions --print`; `opencode` defaults to
-  `opencode run --model openrouter/openrouter/auto --auto` (OpenRouter Auto
-  Router).
+  `opencode run --standalone --model openrouter/openrouter/auto --auto`
+  (OpenRouter Auto Router; `--standalone` is what makes the override below
+  take effect).
+- `OPENCODE_CONFIG_CONTENT` — JSON exported into every agent launch and
+  merged over the operator's opencode config. Default
+  `{"permission":{"task":"deny"}}`: reviewers may not spawn sub-agents,
+  which re-read the whole PR context and were ~30% of opencode tokens.
+  Empty disables the export.
 - `AGENT_COMMANDS` — optional JSON object mapping extra agent names to CLI
   commands, e.g. `{"gemini": "gemini --approval-mode yolo"}`. A value may
   also be an object declaring the vendor behind the command:
   `{"grok": {"command": "grok --always-approve --permission-mode
   bypassPermissions --prompt-file /dev/stdin", "vendor": "xai"}}` (the
-  tracked config registers xAI's native Grok CLI this way). A key may also
+  tracked config registers xAI's native Grok CLI this way, plus `deepseek`
+  and `glm`: opencode pinned to cheap flash models on OpenRouter, vendor
+  `openrouter`, which run the 7 perspectives and generic-b by default). A key may also
   shadow a built-in to repoint it. This is how "something else" becomes an
   orchestrator with a config-only change.
 - `AGENT_TIMEOUT_SECS` — per-agent wall-clock cap. Default 1800.

@@ -109,6 +109,9 @@ header of that file for every knob. Notable ones:
 - `BOT_NAME` — comment-body signature.
 - `DCLAUDE_CMD`, `CODEX_CMD`, `CLINE_CMD`, `OPENCODE_CMD` — agent CLI
   commands.
+- `OPENCODE_CONFIG_CONTENT` — JSON merged over your opencode config for
+  every agent run. The default denies the subagent tool so reviewers can't
+  spawn sub-agents that re-read the whole PR. Empty disables it.
 - `PERSPECTIVE_AGENTS`, `GENERIC_A_AGENTS`, `GENERIC_B_AGENTS`,
   `MANAGER_AGENTS`, `SECURITY_TRIAGE_AGENTS`, `ISSUE_TRIAGE_AGENTS` —
   ordered fallback lists per role. The first candidate whose binary exists

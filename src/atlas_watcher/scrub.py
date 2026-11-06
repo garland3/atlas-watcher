@@ -15,6 +15,8 @@ _FORBIDDEN_WORDS = (
     r"cline",
     r"opencode",
     r"openrouter",
+    r"deepseek",
+    r"zhipu",
 )
 
 # The xAI/Grok tokens are narrower than the list above, on purpose: "grok"
@@ -29,6 +31,11 @@ _XAI_WORDS = (
     r"grok[-_.\s]?\d",   # grok-4, grok 4.7, grok4
     r"x\.ai",
     r"\bx-ai\b",
+    # Same split for GLM, which is also the statistics term (generalized
+    # linear model): only model ids ("glm-5.3") and the org ("z-ai", "z.ai").
+    r"glm[-_.\s]?\d",
+    r"\bz\.ai\b",
+    r"\bz-ai\b",
 )
 # Trailing "s?" catches plurals/org forms ("anthropics", "codexes" → "codex"
 # already matches); \b handles possessives ("claude's") on its own.
