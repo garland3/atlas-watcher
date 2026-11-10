@@ -25,6 +25,12 @@ def test_deepseek_and_glm_identity_terms_are_scrubbed():
             assert term not in out, (leak, out)
 
 
+def test_qwen_identity_terms_are_scrubbed():
+    for leak in ("local/qwen3.8-27b", "Qwen reviewed it", "QWEN3.8"):
+        out = scrub_identity(leak).lower()
+        assert "qwen" not in out, (leak, out)
+
+
 def test_glm_as_a_statistics_term_survives():
     text = "Fit a GLM here; the glm() call in stats.py drops the offset."
     assert scrub_identity(text) == text

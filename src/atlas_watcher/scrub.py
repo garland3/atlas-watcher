@@ -17,6 +17,7 @@ _FORBIDDEN_WORDS = (
     r"openrouter",
     r"deepseek",
     r"zhipu",
+    r"qwen\d*",          # model ids: "qwen3.8" has no boundary after "qwen"
 )
 
 # The xAI/Grok tokens are narrower than the list above, on purpose: "grok"

@@ -37,9 +37,13 @@ class AgentCommand(BaseModel):
     A bare string in AGENT_COMMANDS is normalized to ``{"command": ...}``.
     ``vendor`` overrides the default vendor for cooldown keying and diversity
     counting — set it when a custom command drives a known vendor's account.
+    ``health`` is an optional URL probed during preflight (any 2xx = up): an
+    agent backed by a local model server is then skipped, like a missing
+    binary, while that server is down, instead of failing ordinarily.
     """
     command: str
     vendor: str | None = None
+    health: str | None = None
 
 
 def _parse_agent_commands(v) -> dict:

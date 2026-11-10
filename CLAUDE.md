@@ -121,7 +121,7 @@ output from a single neutral review bot. They must **never**:
 
 - Mention or hint at the underlying model, vendor, or tool: `claude`,
   `anthropic`, `codex`, `openai`, `gpt`, `chatgpt`, `cline`, `opencode`,
-  `openrouter`, `grok`, `xai`, `deepseek`, `glm`, `zhipu`, `llm`,
+  `openrouter`, `grok`, `xai`, `deepseek`, `glm`, `zhipu`, `qwen`, `llm`,
   `language model`, `as an ai`,
   `i am an ai`, etc.
 - Refer to "the perspectives", "the swarm", "the reviewers", or the
@@ -155,7 +155,7 @@ identity-shaped forms (`grok-4.7`, `x.ai`, `x-ai`) while
 `prompts/identity.md` forbids the bare words at the source. A missed bare
 mention costs less than a mangled review. `glm` (also the statistics term,
 generalized linear model) gets the same split: `glm-5.3`, `z-ai` and `z.ai`
-are scrubbed, the bare word is not. `deepseek` and `zhipu` are unambiguous
+are scrubbed, the bare word is not. `deepseek`, `zhipu` and `qwen` are unambiguous
 and scrubbed outright. Keep that split when adding the next vendor whose
 name doubles as an ordinary word.
 
@@ -451,7 +451,13 @@ Everything tunable lives in `config.env`. Override locally with
   tracked config registers xAI's native Grok CLI this way, plus `deepseek`
   and `glm`: opencode pinned to cheap flash models on OpenRouter, vendor
   `openrouter`, which run the 7 perspectives, generic-b, the manager and both
-  triage roles by default). A key may also
+  triage roles by default). An entry may also carry a `health` URL probed
+  at preflight: while it does not answer 2xx the agent counts as absent and
+  the role fails over before launch. The tracked config uses that for
+  `local` — opencode against a vLLM server on this machine (vendor `local`,
+  provider defined in `OPENCODE_CONFIG_CONTENT`), a credit-free last-resort
+  fallback in every role and the second choice in generic-b so a review keeps
+  a second vendor when the paid accounts are paused. A key may also
   shadow a built-in to repoint it. This is how "something else" becomes an
   orchestrator with a config-only change.
 - `AGENT_TIMEOUT_SECS` — per-agent wall-clock cap. Default 1800.

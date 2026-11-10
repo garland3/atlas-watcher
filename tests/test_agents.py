@@ -156,3 +156,36 @@ def test_refresh_binaries_forgets_the_cache(patch_settings):
     assert agents.binary_available.cache_info().currsize >= 1
     agents.refresh_binaries()
     assert agents.binary_available.cache_info().currsize == 0
+
+
+def test_health_url_gates_preflight(patch_settings):
+    # A local-model agent whose server is down must be skipped like a
+    # missing binary (so the role fails over), not launched to fail.
+    import http.server
+    import threading
+
+    class OK(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), OK)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    up = f"http://127.0.0.1:{srv.server_address[1]}/health"
+    srv_down = http.server.HTTPServer(("127.0.0.1", 0), OK)
+    down = f"http://127.0.0.1:{srv_down.server_address[1]}/health"
+    srv_down.server_close()
+    try:
+        patch_settings(agent_commands={
+            "local-up": AgentCommand(command="bash", health=up),
+            "local-down": AgentCommand(command="bash", health=down),
+        })
+        agents.refresh_binaries()
+        assert agents.binary_available("local-up") is True
+        assert agents.binary_available("local-down") is False
+    finally:
+        srv.shutdown()
+        agents.refresh_binaries()

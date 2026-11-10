@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import shlex
 import subprocess
+import urllib.request
 
 from . import cooldown
 from .config import AGENT_COMMAND_FIELDS, AGENT_VENDORS, settings
@@ -112,7 +113,26 @@ def binary_available(agent: str) -> bool:
         ["bash", "-lc", f"command -v {shlex.quote(bin0)} >/dev/null 2>&1"],
         capture_output=True, check=False,
     )
-    return probe.returncode == 0
+    if probe.returncode != 0:
+        return False
+    spec = settings.agent_commands.get(agent)
+    if spec and spec.health:
+        return _healthy(spec.health)
+    return True
+
+
+def _healthy(url: str, timeout: float = 5.0) -> bool:
+    """Is the model server behind an agent answering? Any 2xx counts.
+
+    A down local server would otherwise surface as an ordinary agent failure
+    (connection refused), which never fails over; treating it like a missing
+    binary moves the role to its next candidate before launch.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (OSError, ValueError):
+        return False
 
 
 def pick(
