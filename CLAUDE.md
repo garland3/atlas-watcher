@@ -76,7 +76,7 @@ subcommand.
    `MANAGER_AGENT` still works) — any of `dclaude`, `codex`, `cline`,
    `opencode`, or a name registered in `AGENT_COMMANDS`; switching it is a
    config-only change. The tracked `config.env` runs `opencode` (OpenRouter Auto Router) first,
-   with `dclaude`, `grok` and `codex` as failovers. That is
+   with `grok`, `dclaude` and `codex` as failovers. That is
    all the manager does — it has no shell/git step and is not given the
    audit repo as its cwd, so an agent that has just ingested untrusted
    upstream text never has a git remote in reach. The harness then scrubs
@@ -421,7 +421,8 @@ Everything tunable lives in `config.env`. Override locally with
   built-ins (`dclaude`, `codex`, `cline`, `opencode`) or names registered
   in `AGENT_COMMANDS`. Supersedes `MANAGER_AGENT`, which is still honored
   when this is unset. Switching it requires no code change. The tracked
-  default is `opencode,dclaude,grok,codex`.
+  default is `opencode,grok,dclaude,codex`; `dclaude` is the third
+  candidate in every role.
 - `PERSPECTIVE_AGENTS`, `GENERIC_A_AGENTS`, `GENERIC_B_AGENTS`,
   `SECURITY_TRIAGE_AGENTS`, `ISSUE_TRIAGE_AGENTS` — the same idea for the
   other roles: ordered fallback lists. Defaults are the legacy single

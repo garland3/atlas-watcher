@@ -172,3 +172,14 @@ def test_openrouter_credit_exhaustion_is_a_limit():
             "requested up to 256000 tokens, but can only afford 3403.")
     info = cooldown.classify_limit(text)
     assert info is not None and info.strong is True
+
+
+def test_payment_required_balance_exhausted_is_a_limit():
+    # A 402 from a prepaid CLI is account-wide: it must pause the vendor so
+    # the role fails over, not stub the slot and fail the diversity gate.
+    text = ('Error: Internal error: {\n  "message": "API error (status 402 '
+            'Payment Required): Build usage balance exhausted",\n'
+            '  "http_status": 402\n}')
+    info = cooldown.classify_limit(text)
+    assert info is not None and info.strong is True
+    assert cooldown.classify_limit("Credits have been depleted.") is not None

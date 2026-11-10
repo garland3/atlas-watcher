@@ -64,6 +64,10 @@ _LIMIT_PATTERNS = (
     # more credits, or fewer max_tokens. ... can only afford 3403."
     r"requires more credits",
     r"can only afford \d+",
+    # Prepaid balance spent (HTTP 402), e.g. "API error (status 402 Payment
+    # Required): ... usage balance exhausted".
+    r"payment required",
+    r"(balance|credits?|quota) (is |are |has been |have been )?(exhausted|depleted|spent)",
 )
 
 # Safety net for wordings nobody has seen yet, applied only to the short
