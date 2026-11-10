@@ -75,8 +75,9 @@ subcommand.
    run it is set by `MANAGER_AGENTS` (ordered fallback list; the legacy
    `MANAGER_AGENT` still works) — any of `dclaude`, `codex`, `cline`,
    `opencode`, or a name registered in `AGENT_COMMANDS`; switching it is a
-   config-only change. The tracked `config.env` runs `opencode` (OpenRouter Auto Router) first,
-   with `grok`, `dclaude` and `codex` as failovers. That is
+   config-only change. The tracked `config.env` runs `deepseek` (a pinned
+   OpenRouter flash model) first, with `grok`, `dclaude` and `codex` as
+   failovers. That is
    all the manager does — it has no shell/git step and is not given the
    audit repo as its cwd, so an agent that has just ingested untrusted
    upstream text never has a git remote in reach. The harness then scrubs
@@ -421,8 +422,9 @@ Everything tunable lives in `config.env`. Override locally with
   built-ins (`dclaude`, `codex`, `cline`, `opencode`) or names registered
   in `AGENT_COMMANDS`. Supersedes `MANAGER_AGENT`, which is still honored
   when this is unset. Switching it requires no code change. The tracked
-  default is `opencode,grok,dclaude,codex`; `dclaude` is the third
-  candidate in every role.
+  default is `deepseek,grok,dclaude,codex`; `dclaude` is the third
+  candidate in every role. No role uses the Auto Router (plain
+  `opencode`): it sent large manager/triage prompts to premium models.
 - `PERSPECTIVE_AGENTS`, `GENERIC_A_AGENTS`, `GENERIC_B_AGENTS`,
   `SECURITY_TRIAGE_AGENTS`, `ISSUE_TRIAGE_AGENTS` — the same idea for the
   other roles: ordered fallback lists. Defaults are the legacy single
@@ -448,7 +450,8 @@ Everything tunable lives in `config.env`. Override locally with
   bypassPermissions --prompt-file /dev/stdin", "vendor": "xai"}}` (the
   tracked config registers xAI's native Grok CLI this way, plus `deepseek`
   and `glm`: opencode pinned to cheap flash models on OpenRouter, vendor
-  `openrouter`, which run the 7 perspectives and generic-b by default). A key may also
+  `openrouter`, which run the 7 perspectives, generic-b, the manager and both
+  triage roles by default). A key may also
   shadow a built-in to repoint it. This is how "something else" becomes an
   orchestrator with a config-only change.
 - `AGENT_TIMEOUT_SECS` — per-agent wall-clock cap. Default 1800.
